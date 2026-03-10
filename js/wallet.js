@@ -1,277 +1,291 @@
-// wallet.js — OPILL Protocol Bitcoin Wallet Integration
-// Mendukung: UniSat, OKX, Xverse
-// API kompatibel dengan KEDUA gaya: Wallet.state.address DAN Wallet.getAddress()
+// wallet.js — Bitcoin wallet integration
+// Supports: OP_WALLET (window.opnet), UniSat (window.unisat), OKX, Xverse
+// OP_WALLET is a fork of UniSat — same API, injected at window.opnet
+// Priority: OP_WALLET > UniSat > OKX > Xverse
 
 const Wallet = (() => {
+  let _address    = null;
+  let _pubkey     = null;
+  let _provider   = null; // 'opwallet' | 'unisat' | 'okx' | 'xverse'
+  let _providerObj = null; // the actual window.xxx object
+  let _btcBalance = 0;
+  let _activityTimer = null;
 
-  // ── State terpusat (kompatibel dengan index.html yang pakai Wallet.state.xxx) ──
-  const state = {
-    connected: false,
-    type: null,       // 'unisat' | 'okx' | 'xverse'
-    address: null,
-    publicKey: null,
-    balance: 0,       // dalam satoshi
-    network: 'testnet'
-  };
-
-  // Metadata tampilan wallet
-  const META = {
-    unisat: { name: 'UniSat Wallet',  icon: '🟠', color: '#FF9500' },
-    okx:    { name: 'OKX Wallet',     icon: '⚫', color: '#000000' },
-    xverse: { name: 'Xverse Wallet',  icon: '🔷', color: '#7B3FE4' },
-  };
-
-  // ── Event emitter ──
-  const _listeners = {};
-  function _emit(event, data) {
-    (_listeners[event] || []).forEach(fn => { try { fn(data); } catch (_) {} });
-  }
-  function on(event, fn) {
-    if (!_listeners[event]) _listeners[event] = [];
-    _listeners[event].push(fn);
-  }
-  // Alias untuk kompatibilitas kode lama: Wallet.onEvent(fn)
-  function onEvent(fn) {
-    ['connect','disconnect','balance','error','accountChanged'].forEach(ev => on(ev, (data) => fn(ev, data)));
+  const LISTENERS = [];
+  function emit(event, data) {
+    LISTENERS.forEach(fn => { try { fn(event, data); } catch(e) { console.warn('[Wallet] listener err', e); } });
   }
 
-  // ── Deteksi wallet yang ter-install ──
-  function detectInstalled() {
-    return {
-      unisat: !!(window.unisat),
-      okx:    !!(window.okxwallet?.bitcoin),
-      xverse: !!(window.BitcoinProvider),
-    };
+  // ——— Activity tracking for auto-logout ———
+  function _startActivityTracking() {
+    const events = ['click', 'keydown', 'mousemove', 'scroll', 'touchstart'];
+    events.forEach(e => document.addEventListener(e, _onActivity, { passive: true }));
+    if (_activityTimer) clearInterval(_activityTimer);
+    _activityTimer = setInterval(() => {
+      if (!_address) return;
+      const session = Storage.getSession();
+      if (!session) {
+        console.log('[Wallet] Session expired, auto-logout');
+        disconnect();
+        if (typeof toast !== 'undefined') toast('Session expired', 'Logged out due to inactivity', 'info');
+      }
+    }, 60_000);
   }
+
+  function _onActivity() { Storage.touchActivity(); }
+
+  // ——— Get the provider object for a given type ———
+  function _getProviderObj(type) {
+    switch (type) {
+      case 'opwallet': return window.opnet || null;
+      case 'unisat':   return window.unisat || null;
+      case 'okx':      return window.okxwallet?.bitcoin || null;
+      case 'xverse':   return window.BitcoinProvider || window.XverseProviders?.BitcoinProvider || null;
+      default: return null;
+    }
+  }
+
+  // ——— Detect available wallets ———
   function detectWallets() {
-    const inst = detectInstalled();
-    return Object.keys(META)
-      .filter(id => inst[id])
-      .map(id => ({ id, ...META[id], status: 'Detected' }));
+    const wallets = [];
+    if (window.opnet)                    wallets.push({ id: 'opwallet', name: 'OP_WALLET',    icon: '🟠', detected: true });
+    if (window.unisat)                   wallets.push({ id: 'unisat',   name: 'UniSat Wallet', icon: '🟡', detected: true });
+    if (window.okxwallet?.bitcoin)       wallets.push({ id: 'okx',      name: 'OKX Wallet',    icon: '⚫', detected: true });
+    if (window.BitcoinProvider || window.XverseProviders?.BitcoinProvider)
+                                         wallets.push({ id: 'xverse',   name: 'Xverse',        icon: '🔷', detected: true });
+    return wallets;
   }
 
-  // ── Ambil provider object ──
-  function _getProvider(type) {
-    if (type === 'unisat') return window.unisat;
-    if (type === 'okx')    return window.okxwallet?.bitcoin;
-    if (type === 'xverse') return window.BitcoinProvider;
-    throw new Error('Unknown wallet type: ' + type);
-  }
-
-  // ── Connect ──
-  async function connect(type) {
+  // ——— Connect ———
+  async function connect(providerId) {
     try {
-      let address, publicKey;
+      const provObj = _getProviderObj(providerId);
+      if (!provObj) throw new Error(`${providerId} wallet not installed`);
 
-      if (type === 'unisat') {
-        if (!window.unisat) throw new Error('UniSat Wallet belum ter-install. Download di unisat.io');
-        const accounts = await window.unisat.requestAccounts();
-        if (!accounts?.length) throw new Error('Tidak ada akun yang tersedia');
-        address   = accounts[0];
-        publicKey = await window.unisat.getPublicKey();
-        // Switch ke testnet
-        try { await window.unisat.switchNetwork('testnet'); } catch (_) {}
+      let address, pubkey;
 
-      } else if (type === 'okx') {
-        if (!window.okxwallet?.bitcoin) throw new Error('OKX Wallet belum ter-install. Download di okx.com');
-        const result = await window.okxwallet.bitcoin.connect();
-        address   = result?.address;
-        publicKey = result?.publicKey;
-        if (!address) throw new Error('OKX tidak mengembalikan alamat');
+      if (providerId === 'opwallet' || providerId === 'unisat') {
+        // OP_WALLET is a fork of UniSat — identical API
+        const accounts = await provObj.requestAccounts();
+        if (!accounts?.length) throw new Error('No accounts returned');
+        address = accounts[0];
+        try { pubkey = await provObj.getPublicKey(); } catch {}
+        // Switch to testnet
+        try { await provObj.switchNetwork('testnet'); } catch {}
 
-      } else if (type === 'xverse') {
-        if (!window.BitcoinProvider) throw new Error('Xverse belum ter-install. Download di xverse.app');
-        const resp = await window.BitcoinProvider.connect({ message: 'Connect to OPILL Protocol' });
-        address   = resp?.addresses?.[0]?.address;
-        publicKey = resp?.addresses?.[0]?.publicKey;
-        if (!address) throw new Error('Xverse tidak mengembalikan alamat');
+      } else if (providerId === 'okx') {
+        const accs = await provObj.connect();
+        address = accs?.address;
+        pubkey  = accs?.publicKey;
+        if (!address) throw new Error('No address returned');
+
+      } else if (providerId === 'xverse') {
+        const resp = await provObj.connect({ message: 'Connect to OPILL Protocol' });
+        address = resp?.addresses?.[0]?.address;
+        pubkey  = resp?.addresses?.[0]?.publicKey;
+        if (!address) throw new Error('No address returned');
 
       } else {
-        throw new Error('Tipe wallet tidak dikenal: ' + type);
+        throw new Error('Unknown provider: ' + providerId);
       }
 
-      // Simpan ke state
-      state.connected  = true;
-      state.type       = type;
-      state.address    = address;
-      state.publicKey  = publicKey;
+      _address     = address;
+      _pubkey      = pubkey;
+      _provider    = providerId;
+      _providerObj = provObj;
 
-      // Ambil balance BTC
       await refreshBtcBalance();
-
-      // Simpan session
-      try { sessionStorage.setItem('opill_wallet', type); } catch (_) {}
-      try {
-        localStorage.setItem('wallet_session', JSON.stringify({
-          provider: type, address, savedAt: Date.now()
-        }));
-        localStorage.setItem('wallet_last_activity', String(Date.now()));
-      } catch (_) {}
-
-      // Listen perubahan akun
-      _listenChanges(type);
-
-      _emit('connect', { address, provider: type, type, publicKey });
-      console.log('[Wallet] Connected:', type, address);
-      return { address, publicKey };
+      Storage.saveSession(_provider, _address);
+      _startActivityTracking();
+      emit('connect', { address: _address, provider: _provider, pubkey: _pubkey });
+      return { address: _address, pubkey: _pubkey };
 
     } catch (err) {
-      _emit('error', { message: err.message });
+      emit('error', { message: err.message });
       throw err;
     }
   }
 
-  // ── Disconnect ──
+  // ——— Disconnect ———
   function disconnect() {
-    state.connected = false;
-    state.type      = null;
-    state.address   = null;
-    state.publicKey = null;
-    state.balance   = 0;
-    try { sessionStorage.removeItem('opill_wallet'); } catch (_) {}
-    try { localStorage.removeItem('wallet_session'); } catch (_) {}
-    _emit('disconnect', {});
+    _address = _pubkey = _provider = _providerObj = null;
+    _btcBalance = 0;
+    if (_activityTimer) { clearInterval(_activityTimer); _activityTimer = null; }
+    Storage.clearSession();
+    emit('disconnect', {});
   }
 
-  // ── Auto-reconnect saat halaman dibuka ──
-  async function tryAutoReconnect() {
+  // ——— Restore session on page load ———
+  async function restoreSession() {
+    const s = Storage.getSession();
+    if (!s) return false;
     try {
-      const saved = sessionStorage.getItem('opill_wallet');
-      if (!saved) return false;
-      const inst = detectInstalled();
-      if (!inst[saved]) return false;
-      await connect(saved);
+      const provObj = _getProviderObj(s.provider);
+      if (!provObj) { Storage.clearSession(); return false; }
+
+      let address;
+      if (s.provider === 'opwallet' || s.provider === 'unisat') {
+        const accounts = await provObj.getAccounts();
+        address = accounts?.[0];
+      } else if (s.provider === 'okx') {
+        // OKX doesn't have getAccounts without connect, skip silent restore
+        Storage.clearSession(); return false;
+      } else if (s.provider === 'xverse') {
+        Storage.clearSession(); return false;
+      }
+
+      if (!address) { Storage.clearSession(); return false; }
+
+      _address     = address;
+      _provider    = s.provider;
+      _providerObj = provObj;
+      try { _pubkey = await provObj.getPublicKey(); } catch {}
+      await refreshBtcBalance();
+      Storage.saveSession(_provider, _address);
+      _startActivityTracking();
+      emit('connect', { address: _address, provider: _provider, pubkey: _pubkey });
       return true;
-    } catch (_) {
-      try { sessionStorage.removeItem('opill_wallet'); } catch (__) {}
+    } catch {
+      Storage.clearSession();
       return false;
     }
   }
-  // Alias untuk kompatibilitas wallet.js lama
-  async function restoreSession() { return tryAutoReconnect(); }
 
-  // ── Fetch BTC Balance ──
+  // ——— BTC balance ———
   async function refreshBtcBalance() {
-    if (!state.connected || !state.address) return 0;
+    if (!_address) return 0;
     try {
-      let sats = 0;
-      if (state.type === 'unisat') {
-        const b = await window.unisat.getBalance();
-        sats = b?.total ?? b?.confirmed ?? 0;
-      } else if (state.type === 'okx') {
-        const b = await window.okxwallet.bitcoin.getBalance();
-        sats = b?.total ?? b?.confirmed ?? 0;
-      } else {
-        // Xverse atau fallback: pakai mempool.space testnet4
-        const res = await fetch(`https://mempool.space/testnet4/api/address/${state.address}`);
-        if (res.ok) {
-          const d = await res.json();
-          sats = (d.chain_stats.funded_txo_sum - d.chain_stats.spent_txo_sum);
-        }
+      // Try mempool.space testnet4 first
+      const res = await fetch(`https://mempool.space/testnet4/api/address/${_address}`);
+      if (res.ok) {
+        const data = await res.json();
+        const sats = (data.chain_stats.funded_txo_sum - data.chain_stats.spent_txo_sum);
+        _btcBalance = sats / 1e8;
+        emit('balance', { btc: _btcBalance, sats });
+        return _btcBalance;
       }
-      state.balance = sats;
-      _emit('balance', { sats, btc: satsToBtc(sats) });
-      return sats;
-    } catch (e) {
-      console.warn('[Wallet] Balance error:', e.message);
-      return state.balance;
-    }
-  }
-  // Alias untuk kode lama
-  function getBtcBalance() { return state.balance / 1e8; }
-
-  // ── Sign Pesan ──
-  async function signMessage(message) {
-    if (!state.connected) throw new Error('Wallet belum terhubung');
-    const p = _getProvider(state.type);
-    if (state.type === 'unisat' || state.type === 'okx') {
-      return await p.signMessage(message);
-    }
-    if (state.type === 'xverse') {
-      const r = await p.request('signMessage', { message, address: state.address });
-      return r?.result?.signature;
-    }
-    throw new Error('signMessage tidak didukung untuk: ' + state.type);
-  }
-
-  // ── Sign PSBT ──
-  async function signPsbt(psbtHex, options = {}) {
-    if (!state.connected) throw new Error('Wallet belum terhubung');
-    const p = _getProvider(state.type);
-    if (state.type === 'unisat') {
-      return await p.signPsbt(psbtHex, options);
-    }
-    if (state.type === 'okx') {
-      return await p.signPsbt(psbtHex, options);
-    }
-    if (state.type === 'xverse') {
-      const r = await p.request('signPsbt', { psbt: psbtHex, ...options });
-      return r?.result?.psbt;
-    }
-    throw new Error('signPsbt tidak didukung untuk: ' + state.type);
-  }
-
-  // ── Broadcast raw tx lewat mempool.space ──
-  async function broadcastTx(txHex) {
-    // Coba UniSat pushTx dulu (lebih cepat)
-    if (state.type === 'unisat') {
-      try {
-        const txid = await window.unisat.pushTx({ rawtx: txHex });
-        return txid;
-      } catch (_) {}
-    }
-    // Fallback: mempool.space testnet4
-    const res = await fetch('https://mempool.space/testnet4/api/tx', {
-      method: 'POST',
-      body: txHex,
-      headers: { 'Content-Type': 'text/plain' }
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error('Broadcast gagal: ' + err);
-    }
-    return await res.text(); // txid
-  }
-
-  // ── Listen perubahan akun ──
-  function _listenChanges(type) {
-    const onAccounts = async (accounts) => {
-      if (!accounts?.length) { disconnect(); return; }
-      state.address = accounts[0];
-      try { state.publicKey = await _getProvider(type).getPublicKey?.(); } catch (_) {}
-      await refreshBtcBalance();
-      _emit('accountChanged', { address: accounts[0] });
-    };
+    } catch {}
     try {
-      if (type === 'unisat') window.unisat.on?.('accountsChanged', onAccounts);
-      if (type === 'okx')    window.okxwallet.bitcoin.on?.('accountsChanged', onAccounts);
-    } catch (_) {}
+      // Fallback: wallet native getBalance
+      if (_providerObj?.getBalance) {
+        const b = await _providerObj.getBalance();
+        _btcBalance = (b?.total || b?.confirmed || 0) / 1e8;
+        emit('balance', { btc: _btcBalance });
+        return _btcBalance;
+      }
+    } catch {}
+    return _btcBalance;
   }
 
-  // ── Helper ──
-  function satsToBtc(sats)        { return (sats / 1e8).toFixed(8); }
-  function shortAddr(addr, n = 8) { if (!addr) return '—'; return addr.slice(0, n) + '…' + addr.slice(-6); }
-  function shortenAddress(addr)   { return shortAddr(addr); }
-  function isConnected()          { return state.connected; }
-  function getAddress()           { return state.address; }
-  function getPubkey()            { return state.publicKey; }
-  function getProvider()          { return state.type; }
+  // ——— Send native BTC (tBTC) ———
+  // Works with OP_WALLET / UniSat: provider.sendBitcoin(toAddress, satoshis)
+  async function sendBitcoin(toAddress, satoshis) {
+    if (!_provider || !_providerObj) throw new Error('Wallet not connected');
+    if (typeof satoshis !== 'number' || satoshis <= 0) throw new Error('Invalid amount');
+
+    if (_provider === 'opwallet' || _provider === 'unisat') {
+      // OP_WALLET & UniSat: sendBitcoin(address, satoshis) -> returns txid
+      const txid = await _providerObj.sendBitcoin(toAddress, satoshis);
+      return txid;
+    }
+
+    if (_provider === 'okx') {
+      const result = await window.okxwallet.bitcoin.sendBitcoin(toAddress, satoshis);
+      return result?.txhash || result;
+    }
+
+    if (_provider === 'xverse') {
+      // Xverse uses sendBtcTransaction
+      return new Promise((resolve, reject) => {
+        window.BitcoinProvider.sendBtcTransaction({
+          payload: {
+            network: { type: 'Testnet' },
+            recipients: [{ address: toAddress, amountSats: BigInt(satoshis) }],
+            senderAddress: _address
+          },
+          onFinish: (resp) => resolve(resp),
+          onCancel: () => reject(new Error('User cancelled'))
+        });
+      });
+    }
+
+    throw new Error('sendBitcoin not supported for: ' + _provider);
+  }
+
+  // ——— Sign PSBT ———
+  async function signPsbt(psbtHex, options = {}) {
+    if (!_provider || !_providerObj) throw new Error('Wallet not connected');
+    if (_provider === 'opwallet' || _provider === 'unisat') {
+      return await _providerObj.signPsbt(psbtHex, options);
+    }
+    if (_provider === 'xverse') {
+      const signed = await _providerObj.signPsbt({ psbt: psbtHex, ...options });
+      return signed?.psbt;
+    }
+    throw new Error('signPsbt not supported for: ' + _provider);
+  }
+
+  // ——— Sign message ———
+  async function signMessage(message) {
+    if (!_provider || !_providerObj) throw new Error('Wallet not connected');
+    if (_provider === 'opwallet' || _provider === 'unisat') {
+      return await _providerObj.signMessage(message);
+    }
+    if (_provider === 'xverse') {
+      const resp = await _providerObj.signMessage({ message, address: _address });
+      return resp?.signature;
+    }
+    if (_provider === 'okx') {
+      return await window.okxwallet.bitcoin.signMessage(message);
+    }
+    throw new Error('signMessage not supported');
+  }
+
+  // ——— Broadcast raw tx ———
+  async function broadcastTx(txHex) {
+    // Try wallet push first
+    if ((_provider === 'opwallet' || _provider === 'unisat') && _providerObj?.pushTx) {
+      try { return await _providerObj.pushTx({ rawtx: txHex }); } catch {}
+    }
+    // Fallback mempool.space
+    const res = await fetch('https://mempool.space/testnet4/api/tx', {
+      method: 'POST', body: txHex, headers: { 'Content-Type': 'text/plain' }
+    });
+    if (res.ok) return await res.text();
+    throw new Error(await res.text());
+  }
+
+  // ——— Helpers ———
+  function shortAddr(addr, n = 8) {
+    if (!addr) return '—';
+    return addr.slice(0, n) + '…' + addr.slice(-6);
+  }
+
+  // State accessors — support both API styles from OPILL codebase
+  const state = new Proxy({}, {
+    get(_, prop) {
+      if (prop === 'connected')  return !!_address;
+      if (prop === 'address')    return _address;
+      if (prop === 'type')       return _provider;
+      if (prop === 'balance')    return Math.round(_btcBalance * 1e8); // in sats
+      if (prop === 'pubkey')     return _pubkey;
+      return undefined;
+    }
+  });
+
+  function isConnected()   { return !!_address; }
+  function getAddress()    { return _address; }
+  function getPubkey()     { return _pubkey; }
+  function getProvider()   { return _provider; }
+  function getBtcBalance() { return _btcBalance; }
+  function onEvent(fn)     { LISTENERS.push(fn); }
 
   return {
-    // State langsung (kompatibel dengan Wallet.state.address di index.html)
-    state, META,
-    // Methods utama
-    connect, disconnect,
-    tryAutoReconnect, restoreSession,
-    refreshBtcBalance, fetchBalance: refreshBtcBalance,
-    signMessage, signPsbt, broadcastTx,
-    // Detection
-    detectInstalled, detectWallets,
-    // Helpers
-    satsToBtc, shortAddr, shortenAddress,
-    isConnected, getAddress, getPubkey, getProvider, getBtcBalance,
-    // Events
-    on, onEvent
+    state,
+    detectWallets, connect, disconnect, restoreSession,
+    refreshBtcBalance, sendBitcoin, signPsbt, signMessage, broadcastTx,
+    shortAddr, isConnected, getAddress, getPubkey, getProvider, getBtcBalance,
+    onEvent
   };
 })();
 
