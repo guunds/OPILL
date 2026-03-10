@@ -1,366 +1,738 @@
-// send_patch.js — PENGGANTI sendSubmit() yang ASLI (kirim transaksi sungguhan)
-// LETAKKAN SETELAH semua script lain di index.html
+// ============================================================
+//  send_patch.js — OPiLL Protocol
+//  Real TX + Real Balance + Real Token Search (all testnets)
+//  Overrides: sendSubmit, _syncSendBalances, sendSearchToken
+// ============================================================
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OVERRIDE: Ganti fungsi sendSubmit yang palsu dengan yang asli
-// ─────────────────────────────────────────────────────────────────────────────
+(function () {
+  'use strict';
 
-// Daftar contract OP-20
-var _sendContracts = {
-  'tBTC':  '',   // Native BTC, tidak ada contract
-  'OPILL': '0xe3e58e9615ac3e8a29a316c64b8c5930600941096377e227cc456bebb7daf3ee',
-  'PILL':  '0xb09fc29c112af8293539477e23d8df1d3126639642767d707277131352040cbb',
-  'MOTO':  '0xfd4473840751d58d9f8b73bdd57d6c5260453d5518bd7cd02d0a4cf3df9bf4dd',
-};
+  // ─────────────────────────────────────────────────────────
+  //  CONSTANTS — Token contracts (real addresses)
+  // ─────────────────────────────────────────────────────────
+  var TOKEN_CONTRACTS = {
+    tBTC:  null,  // native
+    OPILL: '0xe3e58e9615ac3e8a29a316c64b8c5930600941096377e227cc456bebb7daf3ee',
+    PILL:  '0xb09fc29c112af8293539477e23d8df1d3126639642767d707277131352040cbb',
+    MOTO:  '0xfd4473840751d58d9f8b73bdd57d6c5260453d5518bd7cd02d0a4cf3df9bf4dd'
+  };
 
-var _sendSelectedToken = 'tBTC';
-var _sendHistory       = [];
-// Balance akan diambil dari OPNetTokens, ini hanya fallback display
-var _sendBalances      = { 'tBTC': '0', 'OPILL': '0', 'PILL': '0', 'MOTO': '0' };
+  var TOKEN_META = {
+    tBTC:  { name: 'Testnet Bitcoin',   icon: '₿',  color: '#f7931a', decimals: 8 },
+    OPILL: { name: 'OPiLL Protocol',    icon: '🟠', color: '#00ff88', decimals: 8 },
+    PILL:  { name: 'PILL Token',        icon: '💊', color: '#00e5ff', decimals: 8 },
+    MOTO:  { name: 'MOTO Token',        icon: '🏍️', color: '#c084fc', decimals: 8 }
+  };
 
-// Update balance display dari real OPNetTokens
-function _syncSendBalances() {
-  if (window.Wallet && Wallet.state && Wallet.state.connected) {
-    const btcSats = Wallet.state.balance || 0;
-    _sendBalances['tBTC'] = (btcSats / 1e8).toFixed(8);
-    if (window.OPNetTokens) {
-      const all = OPNetTokens.getAllBalances();
-      Object.assign(_sendBalances, all);
+  // ALL OP_NET testnet RPC endpoints to try
+  var OPNET_RPCS = [
+    'https://testnet.opnet.org',
+    'https://testnet4.opnet.org',
+    'https://regtest.opnet.org'
+  ];
+
+  var MEMPOOL_API = 'https://mempool.opnet.org/testnet4/api';
+  var MEMPOOL_TX  = 'https://mempool.opnet.org/testnet4/tx/';
+
+  // ─────────────────────────────────────────────────────────
+  //  TOKEN SEARCH DATABASE — built from real contract list
+  //  Also supports searching by contract address fragment
+  // ─────────────────────────────────────────────────────────
+  var _tokenSearchDB = Object.keys(TOKEN_CONTRACTS).map(function(sym) {
+    var addr = TOKEN_CONTRACTS[sym] || 'native';
+    var meta = TOKEN_META[sym] || {};
+    return {
+      sym:   sym,
+      name:  meta.name  || sym,
+      addr:  addr,
+      icon:  meta.icon  || '🪙',
+      color: meta.color || '#ffffff'
+    };
+  });
+
+  // ─────────────────────────────────────────────────────────
+  //  HELPER: Bitcoin address validator (testnet4)
+  // ─────────────────────────────────────────────────────────
+  function isValidBtcTestnet(addr) {
+    if (!addr) return false;
+    addr = addr.trim();
+    // tb1... (bech32 testnet)
+    if (/^tb1[a-z0-9]{25,90}$/i.test(addr)) return true;
+    // tBCRT (regtest bech32)
+    if (/^bcrt1[a-z0-9]{25,90}$/i.test(addr)) return true;
+    // m... or n... (P2PKH testnet)
+    if (/^[mn][1-9A-HJ-NP-Za-km-z]{25,34}$/.test(addr)) return true;
+    // 2... (P2SH testnet)
+    if (/^2[1-9A-HJ-NP-Za-km-z]{25,34}$/.test(addr)) return true;
+    // OP_NET wallet format opt1...
+    if (/^opt1[a-z0-9]{20,90}$/i.test(addr)) return true;
+    return false;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  //  HELPER: addr -> 32-byte hex for OP-20 calldata
+  //  Encodes Bitcoin address as UTF-8 bytes, right-padded to 32
+  // ─────────────────────────────────────────────────────────
+  function addrToCalldata(addr) {
+    var bytes = [];
+    for (var i = 0; i < addr.length && i < 32; i++) {
+      bytes.push(addr.charCodeAt(i).toString(16).padStart(2, '0'));
     }
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FUNGSI UTAMA — sendSubmit YANG BENAR
-// ─────────────────────────────────────────────────────────────────────────────
-async function sendSubmit() {
-  const recipient = (document.getElementById('send-recipient') || {}).value?.trim() || '';
-  const amount    = parseFloat((document.getElementById('send-amount') || {}).value || '0');
-
-  // ── Validasi wallet ──
-  if (!window.Wallet || !Wallet.state?.connected || !Wallet.state?.address) {
-    sendShowStatus('⚠️ Hubungkan wallet dulu!', '#ff4466');
-    return;
+    while (bytes.length < 32) bytes.push('00');
+    return bytes.join('');
   }
 
-  // ── Validasi input ──
-  if (!recipient) {
-    sendShowStatus('⚠️ Masukkan alamat tujuan (tb1...)', '#ff4466');
-    return;
-  }
-  if (!recipient.startsWith('tb1') && !recipient.startsWith('m') && !recipient.startsWith('n') && !recipient.startsWith('2')) {
-    sendShowStatus('⚠️ Alamat harus berformat Bitcoin testnet (tb1... atau m... atau n...)', '#ff4466');
-    return;
-  }
-  if (!amount || amount <= 0) {
-    sendShowStatus('⚠️ Masukkan jumlah yang valid!', '#ff4466');
-    return;
-  }
-  if (recipient === Wallet.state.address) {
-    sendShowStatus('⚠️ Tidak bisa kirim ke alamat sendiri!', '#ff4466');
-    return;
+  // ─────────────────────────────────────────────────────────
+  //  HELPER: amount -> 32-byte hex (little-endian for OP-20)
+  // ─────────────────────────────────────────────────────────
+  function amountToHex32(amount, decimals) {
+    decimals = decimals || 8;
+    var raw = Math.round(amount * Math.pow(10, decimals));
+    var hex = raw.toString(16);
+    return hex.padStart(64, '0');
   }
 
-  const btn = document.getElementById('send-btn');
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ Memproses...'; }
-
-  try {
-    const fromAddr = Wallet.state.address;
-    const token    = _sendSelectedToken;
-    let txid       = null;
-
-    // ── CASE 1: Kirim tBTC native ────────────────────────────────────────────
-    if (token === 'tBTC') {
-      sendShowStatus('📝 Menghitung UTXO...', '#f7931a');
-
-      const amountSats = Math.round(amount * 1e8);
-      const utxoInfo   = await OPNet.sendBTC({
-        fromAddress: fromAddr,
-        toAddress:   recipient,
-        amountSats,
-        feeRate:     10
-      });
-
-      sendShowStatus('✍️ Minta tanda tangan di wallet...', '#f7931a');
-
-      // Buat pesan yang berisi info transaksi untuk signing
-      // (PSBT sebenarnya butuh library bitcoin-js, ini simplified flow)
-      const txMsg = JSON.stringify({
-        type: 'bitcoin_transfer',
-        from: fromAddr,
-        to:   recipient,
-        amount: amountSats,
-        fee:   utxoInfo.feeSats,
-        utxos: utxoInfo.utxos.length,
-        ts:    Date.now()
-      });
-
-      // Sign lewat wallet extension
-      const signature = await Wallet.signMessage(txMsg);
-      if (!signature) throw new Error('Signing dibatalkan');
-
-      // NOTE: Untuk broadcast BTC sebenarnya, kamu perlu:
-      // 1. Library bitcoin (bitcoinjs-lib atau @btc-vision/bitcoin)
-      // 2. Build PSBT dengan input UTXOs + output recipient + change
-      // 3. Sign PSBT → Broadcast
-      // Karena ini static JS (tanpa npm), kita pakai wallet's sendBitcoin jika ada
-
-      if (Wallet.state.type === 'unisat' && window.unisat?.sendBitcoin) {
-        sendShowStatus('📡 Broadcasting ke Bitcoin testnet4...', '#f7931a');
-        txid = await window.unisat.sendBitcoin(recipient, amountSats);
-      } else if (Wallet.state.type === 'okx' && window.okxwallet?.bitcoin?.sendBitcoin) {
-        sendShowStatus('📡 Broadcasting ke Bitcoin testnet4...', '#f7931a');
-        txid = await window.okxwallet.bitcoin.sendBitcoin(recipient, amountSats);
-      } else {
-        // Xverse atau wallet lain — pakai signPsbt flow
-        throw new Error(
-          'Wallet ' + Wallet.state.type + ' membutuhkan PSBT builder. ' +
-          'Coba gunakan UniSat atau OKX yang mendukung sendBitcoin langsung.'
-        );
-      }
-
-    // ── CASE 2: Kirim token OP-20 (OPILL, PILL, MOTO) ───────────────────────
-    } else {
-      const tokenInfo = window.OPNetTokens?.getToken(token);
-      if (!tokenInfo) throw new Error('Token tidak dikenal: ' + token);
-
-      const contractAddr = _sendContracts[token];
-      if (!contractAddr) throw new Error('Contract address tidak ditemukan untuk: ' + token);
-
-      sendShowStatus('🔍 Cek saldo dan UTXO...', '#f7931a');
-
-      // Konversi amount ke unit terkecil (18 decimals)
-      const amountRaw = OPNet.parseUnits(String(amount), tokenInfo.decimals);
-
-      // Cek saldo
-      const currentBal = window.OPNetTokens?.getBalance(token) || '0';
-      if (parseFloat(currentBal) < amount) {
-        throw new Error(`Saldo ${token} tidak cukup. Punya: ${currentBal}, mau kirim: ${amount}`);
-      }
-
-      // Cek apakah ada tBTC untuk fee
-      const btcSats = Wallet.state.balance || 0;
-      if (btcSats < 2000) { // minimal 2000 sat (~$1.2) untuk fee
-        throw new Error(
-          'tBTC tidak cukup untuk membayar fee transaksi OP_NET. ' +
-          'Minimal 2000 satoshi. Sekarang: ' + btcSats + ' sat. ' +
-          'Klaim tBTC dari Faucet dulu!'
-        );
-      }
-
-      sendShowStatus('✍️ Minta tanda tangan di wallet...', '#f7931a');
-
-      // Encode OP-20 transfer calldata
-      const toBytes  = OPNet.addressToBytes32(recipient);
-      const amtHex   = amountRaw.toString(16).padStart(64, '0');
-      const calldata = '0xa9059cbb' + toBytes + amtHex;
-
-      // Sign message yang berisi info transaksi
-      const txMsg = JSON.stringify({
-        type:     'op20_transfer',
-        contract: contractAddr,
-        from:     fromAddr,
-        to:       recipient,
-        amount:   amountRaw.toString(),
-        token:    token,
-        calldata: calldata,
-        ts:       Date.now()
-      });
-
-      const signature = await Wallet.signMessage(txMsg);
-      if (!signature) throw new Error('Signing dibatalkan');
-
-      sendShowStatus('📡 Broadcast ke OP_NET...', '#f7931a');
-
-      // Broadcast ke OP_NET
+  // ─────────────────────────────────────────────────────────
+  //  HELPER: try multiple RPCs until one works
+  // ─────────────────────────────────────────────────────────
+  async function rpcCall(method, params) {
+    var body = JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method: method, params: params });
+    for (var i = 0; i < OPNET_RPCS.length; i++) {
       try {
-        txid = await OPNet.rpc('eth_sendRawTransaction', ['0x' + calldata.replace('0x', '')]);
-      } catch (rpcErr) {
-        // Beberapa OP_NET node tidak terima eth_sendRawTransaction dari browser
-        // Coba endpoint berbeda
-        console.warn('[Send] eth_sendRawTransaction gagal:', rpcErr.message);
+        var r = await fetch(OPNET_RPCS[i], {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: body,
+          signal: AbortSignal.timeout(6000)
+        });
+        if (!r.ok) continue;
+        var j = await r.json();
+        if (j.error) continue;
+        return j.result;
+      } catch (e) { /* try next */ }
+    }
+    return null;
+  }
 
-        // Fallback: kirim via REST API
-        const postRes = await fetch('https://testnet.opnet.org/api/v1/transaction/broadcast', {
+  // ─────────────────────────────────────────────────────────
+  //  HELPER: broadcast signed tx hex
+  // ─────────────────────────────────────────────────────────
+  async function broadcastTx(txHex) {
+    // 1. Try wallet native push
+    var provider = getProvider();
+    if (provider) {
+      try {
+        if (typeof provider.pushTx === 'function') {
+          return await provider.pushTx({ rawtx: txHex });
+        }
+      } catch (e) { /* fallback */ }
+    }
+    // 2. Try mempool.space testnet4 broadcast
+    try {
+      var r = await fetch(MEMPOOL_API + '/tx', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: txHex,
+        signal: AbortSignal.timeout(10000)
+      });
+      if (r.ok) return await r.text();
+    } catch (e) { /* fallback */ }
+    // 3. Try OP_NET RPC eth_sendRawTransaction
+    var result = await rpcCall('eth_sendRawTransaction', ['0x' + txHex]);
+    return result;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  //  HELPER: get wallet provider
+  // ─────────────────────────────────────────────────────────
+  function getProvider() {
+    if (window.opnet) return window.opnet;
+    if (window.unisat) return window.unisat;
+    if (window.okxwallet && window.okxwallet.bitcoin) return window.okxwallet.bitcoin;
+    return null;
+  }
+
+  function getWalletType() {
+    if (window.Wallet && window.Wallet.state) return window.Wallet.state.type || 'opwallet';
+    if (window.opnet) return 'opwallet';
+    if (window.unisat) return 'unisat';
+    if (window.okxwallet && window.okxwallet.bitcoin) return 'okx';
+    return null;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  //  FETCH: tBTC balance
+  // ─────────────────────────────────────────────────────────
+  async function fetchBtcBalance(address) {
+    // 1. Wallet native
+    try {
+      var p = getProvider();
+      if (p && typeof p.getBalance === 'function') {
+        var b = await p.getBalance();
+        var sats = b.total || b.confirmed || 0;
+        if (sats > 0) return sats / 1e8;
+      }
+    } catch (e) { /* fallback */ }
+    // 2. Wallet state
+    if (window.Wallet && window.Wallet.state && window.Wallet.state.balance > 0) {
+      return window.Wallet.state.balance / 1e8;
+    }
+    // 3. Mempool API
+    try {
+      var r = await fetch(MEMPOOL_API + '/address/' + address, {
+        signal: AbortSignal.timeout(6000)
+      });
+      if (r.ok) {
+        var d = await r.json();
+        var chain = (d.chain_stats || {});
+        var mempl = (d.mempool_stats || {});
+        var funded   = (chain.funded_txo_sum   || 0) + (mempl.funded_txo_sum   || 0);
+        var spent    = (chain.spent_txo_sum    || 0) + (mempl.spent_txo_sum    || 0);
+        return Math.max(0, funded - spent) / 1e8;
+      }
+    } catch (e) { /* */ }
+    return 0;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  //  FETCH: OP-20 token balance — tries 4 methods across all RPCs
+  // ─────────────────────────────────────────────────────────
+  async function fetchTokenBalance(contractAddr, walletAddr) {
+    if (!contractAddr || !walletAddr) return 0;
+
+    // Method 1: Wallet native getBalance().tokens
+    try {
+      var p = getProvider();
+      if (p && typeof p.getBalance === 'function') {
+        var wb = await p.getBalance();
+        if (wb && wb.tokens) {
+          var sc = contractAddr.toLowerCase();
+          var found = null;
+          if (Array.isArray(wb.tokens)) {
+            found = wb.tokens.find(function(t) {
+              return t && t.contract && t.contract.toLowerCase() === sc;
+            });
+          } else if (typeof wb.tokens === 'object') {
+            var keys = Object.keys(wb.tokens);
+            for (var ki = 0; ki < keys.length; ki++) {
+              if (keys[ki].toLowerCase() === sc) {
+                found = { balance: wb.tokens[keys[ki]] };
+                break;
+              }
+            }
+          }
+          if (found && found.balance !== undefined) {
+            var bal = parseFloat(found.balance) || 0;
+            if (bal > 0) return bal / 1e8;
+          }
+        }
+      }
+    } catch (e) { /* next */ }
+
+    // Method 2: OP_NET REST API /api/v1/token/{contract}/balance/{address}
+    for (var ri = 0; ri < OPNET_RPCS.length; ri++) {
+      try {
+        var base = OPNET_RPCS[ri].replace(/\/$/, '');
+        var restUrl = base + '/api/v1/token/' + contractAddr + '/balance/' + walletAddr;
+        var rr = await fetch(restUrl, { signal: AbortSignal.timeout(5000) });
+        if (rr.ok) {
+          var rd = await rr.json();
+          var rawBal = rd.balance || rd.result || rd.amount || 0;
+          if (rawBal && rawBal !== '0') {
+            return parseFloat(rawBal) / 1e8;
+          }
+        }
+      } catch (e) { /* next */ }
+    }
+
+    // Method 3: eth_call balanceOf — encode wallet address as bytes32
+    var calldata = '0x70a08231' + addrToCalldata(walletAddr);
+    for (var rj = 0; rj < OPNET_RPCS.length; rj++) {
+      try {
+        var base2 = OPNET_RPCS[rj];
+        var cr = await fetch(base2, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            contractAddress: contractAddr,
-            calldata:        calldata,
-            senderAddress:   fromAddr,
-            signature:       signature,
-            network:         'testnet'
-          })
+            jsonrpc: '2.0', id: Date.now(),
+            method: 'eth_call',
+            params: [{ to: contractAddr, data: calldata }, 'latest']
+          }),
+          signal: AbortSignal.timeout(6000)
         });
-
-        if (postRes.ok) {
-          const postData = await postRes.json();
-          txid = postData?.txid || postData?.hash || postData?.transactionId;
-        } else {
-          const errText = await postRes.text();
-          throw new Error('Broadcast gagal: ' + errText.slice(0, 200));
+        if (cr.ok) {
+          var cj = await cr.json();
+          if (cj.result && cj.result !== '0x' && cj.result !== '0x0') {
+            var raw = parseInt(cj.result, 16);
+            if (!isNaN(raw) && raw > 0) return raw / 1e8;
+          }
         }
+      } catch (e) { /* next */ }
+    }
+
+    // Method 4: POST /api/v1/contract/{contract}/call
+    for (var rk = 0; rk < OPNET_RPCS.length; rk++) {
+      try {
+        var base3 = OPNET_RPCS[rk].replace(/\/$/, '');
+        var pr = await fetch(base3 + '/api/v1/contract/' + contractAddr + '/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            method: 'balanceOf',
+            params: [walletAddr]
+          }),
+          signal: AbortSignal.timeout(5000)
+        });
+        if (pr.ok) {
+          var pd = await pr.json();
+          var b2 = pd.balance || pd.result || 0;
+          if (b2 && b2 !== '0') return parseFloat(b2) / 1e8;
+        }
+      } catch (e) { /* next */ }
+    }
+
+    return 0;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  //  SYNC BALANCES → updates _sendBalances + UI chips
+  // ─────────────────────────────────────────────────────────
+  window._syncSendBalances = async function () {
+    var addr = window.Wallet && window.Wallet.state && window.Wallet.state.address;
+    if (!addr) return;
+
+    // BTC
+    var btc = await fetchBtcBalance(addr);
+    window._sendBalances = window._sendBalances || {};
+    window._sendBalances['tBTC'] = btc.toFixed(6);
+    _refreshChip('tBTC');
+
+    // OP-20 tokens
+    var tokens = ['OPILL', 'PILL', 'MOTO'];
+    for (var i = 0; i < tokens.length; i++) {
+      (function(sym) {
+        var sc = TOKEN_CONTRACTS[sym];
+        fetchTokenBalance(sc, addr).then(function(bal) {
+          window._sendBalances[sym] = bal > 0 ? bal.toLocaleString(undefined, { maximumFractionDigits: 4 }) : '0';
+          _refreshChip(sym);
+        }).catch(function() {
+          window._sendBalances[sym] = '0';
+        });
+      })(tokens[i]);
+    }
+  };
+
+  function _refreshChip(tok) {
+    var bal = window._sendBalances && window._sendBalances[tok];
+    var el = document.getElementById('send-bal-' + tok.toLowerCase());
+    if (el && bal) el.textContent = bal + ' ' + tok;
+    // also update currently selected token display
+    if (window._sendSelectedToken === tok) {
+      var balEl = document.getElementById('send-selected-bal');
+      if (balEl) balEl.textContent = bal + ' ' + tok;
+    }
+    // update the token grid chip
+    document.querySelectorAll('.send-tok-btn').forEach(function(btn) {
+      if (btn.getAttribute('data-tok') === tok) {
+        var b = btn.querySelector('.send-tok-bal');
+        if (b) b.textContent = bal || '—';
+      }
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────
+  //  TOKEN SEARCH — real contract addresses + multi-network
+  // ─────────────────────────────────────────────────────────
+  window.sendSearchToken = function (val) {
+    var clearBtn = document.getElementById('send-search-clear');
+    var results  = document.getElementById('send-search-results');
+    if (!results) return;
+
+    val = (val || '').trim().toLowerCase();
+    if (!val) {
+      results.style.display = 'none';
+      if (clearBtn) clearBtn.style.display = 'none';
+      return;
+    }
+    if (clearBtn) clearBtn.style.display = 'flex';
+
+    var matches = _tokenSearchDB.filter(function(t) {
+      return t.sym.toLowerCase().includes(val) ||
+             t.name.toLowerCase().includes(val) ||
+             t.addr.toLowerCase().includes(val);
+    });
+
+    // If no match but looks like a contract address → search all RPCs live
+    var looksLikeContract = val.startsWith('0x') && val.length >= 6;
+
+    if (matches.length === 0 && looksLikeContract) {
+      results.style.display = 'block';
+      results.innerHTML = '<div style="padding:12px 16px;font-size:12px;color:var(--orange);text-align:center">🔍 Searching all testnets for contract...</div>';
+      _searchContractAllNetworks(val, results);
+      return;
+    }
+
+    if (matches.length === 0) {
+      results.style.display = 'block';
+      results.innerHTML = '<div style="padding:14px 16px;font-size:12px;color:var(--text-muted);text-align:center">No token found for "' + val + '"</div>';
+      return;
+    }
+
+    results.style.display = 'block';
+    results.innerHTML = matches.map(function(t) {
+      var addrDisplay = t.addr === 'native' ? 'Native Bitcoin' : (t.addr.slice(0, 14) + '...' + t.addr.slice(-8));
+      return '<div onclick="sendPickSearchToken(\'' + t.sym + '\')" style="display:flex;align-items:center;gap:12px;padding:10px 16px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .15s" onmouseover="this.style.background=\'rgba(247,147,26,0.08)\'" onmouseout="this.style.background=\'transparent\'">'
+        + '<div style="font-size:20px;width:28px;text-align:center">' + t.icon + '</div>'
+        + '<div style="flex:1;min-width:0">'
+        +   '<div style="font-family:Syne,sans-serif;font-weight:700;font-size:13px;color:' + t.color + '">' + t.sym + '</div>'
+        +   '<div style="font-size:10px;color:var(--text-muted);margin-top:1px">' + t.name + '</div>'
+        +   '<div style="font-size:9px;color:rgba(255,255,255,0.25);font-family:monospace;margin-top:2px">' + addrDisplay + '</div>'
+        + '</div>'
+        + '<div style="font-size:10px;color:var(--orange);font-weight:700;opacity:0.7">SELECT →</div>'
+        + '</div>';
+    }).join('');
+  };
+
+  // Search unknown contract address across all OP_NET testnet RPCs
+  async function _searchContractAllNetworks(contractAddr, resultsEl) {
+    var found = null;
+
+    for (var ri = 0; ri < OPNET_RPCS.length; ri++) {
+      try {
+        var base = OPNET_RPCS[ri].replace(/\/$/, '');
+        // Try get token info
+        var infoUrl = base + '/api/v1/token/' + contractAddr;
+        var r = await fetch(infoUrl, { signal: AbortSignal.timeout(5000) });
+        if (r.ok) {
+          var d = await r.json();
+          if (d && (d.symbol || d.name || d.decimals !== undefined)) {
+            found = {
+              sym:  d.symbol || 'UNKNOWN',
+              name: d.name   || 'Unknown Token',
+              addr: contractAddr,
+              icon: '🪙',
+              color: '#ffffff',
+              decimals: d.decimals || 8,
+              network: OPNET_RPCS[ri]
+            };
+            break;
+          }
+        }
+      } catch (e) { /* next */ }
+    }
+
+    if (!found) {
+      // Try eth_call name() selector 0x06fdde03
+      for (var rj = 0; rj < OPNET_RPCS.length; rj++) {
+        try {
+          var nr = await fetch(OPNET_RPCS[rj], {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0', id: Date.now(),
+              method: 'eth_call',
+              params: [{ to: contractAddr, data: '0x06fdde03' }, 'latest']
+            }),
+            signal: AbortSignal.timeout(5000)
+          });
+          if (nr.ok) {
+            var nj = await nr.json();
+            if (nj.result && nj.result !== '0x' && nj.result.length > 10) {
+              // decode UTF-8 name from hex result
+              var hex = nj.result.slice(2);
+              var name = '';
+              try {
+                // skip first 64 bytes (offset) + 64 bytes (length), then decode
+                var offset = parseInt(hex.slice(0, 64), 16) * 2;
+                var length = parseInt(hex.slice(64, 128), 16) * 2;
+                var nameHex = hex.slice(128, 128 + length);
+                for (var ci = 0; ci < nameHex.length; ci += 2) {
+                  var cc = parseInt(nameHex.slice(ci, ci + 2), 16);
+                  if (cc > 0) name += String.fromCharCode(cc);
+                }
+              } catch (de) { name = 'Unknown Token'; }
+
+              found = {
+                sym:     name.toUpperCase().slice(0, 8) || 'UNKNOWN',
+                name:    name || 'Unknown Token',
+                addr:    contractAddr,
+                icon:    '🪙',
+                color:   '#ffffff',
+                decimals: 8,
+                network: OPNET_RPCS[rj]
+              };
+              break;
+            }
+          }
+        } catch (e) { /* next */ }
       }
     }
 
-    // ── SUKSES ──────────────────────────────────────────────────────────────
-    const shortTxid = txid ? txid.slice(0, 20) + '...' : '(menunggu konfirmasi)';
-    sendShowStatus('✅ Transaksi terkirim! TXID: ' + shortTxid, '#00ff88');
+    if (!resultsEl) return;
 
-    // Simpan ke history
-    const now = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const histEntry = {
-      time:   now,
-      token,
-      amount,
-      to:     recipient,
-      from:   fromAddr,
-      txid:   txid || 'pending',
-      status: 'confirmed',
-      ts:     Date.now()
-    };
-    _sendHistory.unshift(histEntry);
-
-    // Simpan ke localStorage
-    if (window.Storage?.addLocalTx) {
-      Storage.addLocalTx({
-        hash:      txid || 'pending_' + Date.now(),
-        type:      'send',
-        from:      { address: fromAddr },
-        to:        { address: recipient, symbol: token, amount },
-        timestamp: Date.now(),
-        status:    'pending'
-      });
+    if (!found) {
+      resultsEl.innerHTML = '<div style="padding:14px 16px;font-size:12px;color:rgba(255,68,68,0.9);text-align:center">❌ Contract not found on any OP_NET testnet<br><span style="color:var(--text-muted);font-size:10px;margin-top:4px;display:block">' + contractAddr.slice(0, 18) + '...</span></div>';
+      return;
     }
 
-    sendRenderHistory();
+    // Add to DB temporarily so it can be selected
+    var alreadyIn = _tokenSearchDB.find(function(t) { return t.addr === found.addr; });
+    if (!alreadyIn) {
+      _tokenSearchDB.push(found);
+      TOKEN_CONTRACTS[found.sym] = found.addr;
+      TOKEN_META[found.sym] = { name: found.name, icon: found.icon, color: found.color, decimals: found.decimals };
+    }
 
-    // Refresh balance setelah 3 detik
-    setTimeout(async () => {
-      if (window.OPNetTokens && Wallet.state?.address) {
-        await OPNetTokens.fetchAllBalances(Wallet.state.address);
-        _syncSendBalances();
-        // Update balance display di send page
-        const balEl = document.getElementById('send-balance');
-        if (balEl) balEl.textContent = (_sendBalances[token] || '0') + ' ' + token;
+    var addrDisplay = found.addr.slice(0, 14) + '...' + found.addr.slice(-8);
+    var networkLabel = found.network.replace('https://', '').replace('/','');
+
+    resultsEl.innerHTML = '<div onclick="sendPickSearchToken(\'' + found.sym + '\')" style="display:flex;align-items:center;gap:12px;padding:10px 16px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .15s;background:rgba(0,255,136,0.04)" onmouseover="this.style.background=\'rgba(247,147,26,0.08)\'" onmouseout="this.style.background=\'rgba(0,255,136,0.04)\'">'
+      + '<div style="font-size:20px;width:28px;text-align:center">' + found.icon + '</div>'
+      + '<div style="flex:1;min-width:0">'
+      +   '<div style="font-family:Syne,sans-serif;font-weight:700;font-size:13px;color:' + found.color + '">' + found.sym + '</div>'
+      +   '<div style="font-size:10px;color:var(--text-muted);margin-top:1px">' + found.name + '</div>'
+      +   '<div style="font-size:9px;color:rgba(0,255,136,0.4);font-family:monospace;margin-top:2px">✓ Found on ' + networkLabel + '</div>'
+      +   '<div style="font-size:9px;color:rgba(255,255,255,0.2);font-family:monospace">' + addrDisplay + '</div>'
+      + '</div>'
+      + '<div style="font-size:10px;color:var(--orange);font-weight:700;opacity:0.7">SELECT →</div>'
+      + '</div>';
+  }
+
+  // ─────────────────────────────────────────────────────────
+  //  UPDATE _sendContracts with real addresses
+  // ─────────────────────────────────────────────────────────
+  window._sendContracts = {
+    'tBTC':  'Native tBTC (OP_NET Testnet4)',
+    'OPILL': TOKEN_CONTRACTS.OPILL,
+    'PILL':  TOKEN_CONTRACTS.PILL,
+    'MOTO':  TOKEN_CONTRACTS.MOTO
+  };
+
+  // ─────────────────────────────────────────────────────────
+  //  MAIN: sendSubmit — REAL TRANSACTIONS
+  // ─────────────────────────────────────────────────────────
+  window.sendSubmit = async function () {
+    var recipientEl = document.getElementById('send-recipient');
+    var amountEl    = document.getElementById('send-amount');
+    var btn         = document.getElementById('send-btn');
+
+    var recipient = (recipientEl ? recipientEl.value : '').trim();
+    var amount    = parseFloat(amountEl ? amountEl.value : '0');
+    var token     = window._sendSelectedToken || 'tBTC';
+
+    // ── Validation ──
+    if (!window.Wallet || !window.Wallet.state || !window.Wallet.state.address) {
+      sendShowStatus('⚠️ Connect wallet first!', '#ff4466'); return;
+    }
+    if (!recipient) {
+      sendShowStatus('⚠️ Enter recipient address!', '#ff4466'); return;
+    }
+    if (!isValidBtcTestnet(recipient)) {
+      sendShowStatus('⚠️ Invalid Bitcoin testnet address!', '#ff4466'); return;
+    }
+    if (!amount || amount <= 0) {
+      sendShowStatus('⚠️ Enter a valid amount!', '#ff4466'); return;
+    }
+
+    var fromAddr = window.Wallet.state.address;
+    var provider = getProvider();
+    if (!provider) {
+      sendShowStatus('⚠️ Wallet provider not found!', '#ff4466'); return;
+    }
+
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Sending...'; }
+    sendShowStatus('📝 Confirm in your wallet...', '#f7931a');
+
+    try {
+      var txid = null;
+
+      // ══════════════════════════════════════════════════════
+      //  CASE 1: tBTC — native Bitcoin transfer
+      // ══════════════════════════════════════════════════════
+      if (token === 'tBTC') {
+        var sats = Math.round(amount * 1e8);
+        if (sats < 546) throw new Error('Amount too small (min 546 sats / dust limit)');
+
+        var wType = getWalletType();
+        if (wType === 'opwallet' || wType === 'unisat') {
+          txid = await provider.sendBitcoin(recipient, sats);
+        } else if (wType === 'okx') {
+          txid = await window.okxwallet.bitcoin.sendBitcoin(recipient, sats);
+        } else if (wType === 'xverse') {
+          var xp = window.XverseProviders && window.XverseProviders.BitcoinProvider;
+          if (xp) {
+            var xresp = await xp.request('sendBtcTransaction', {
+              recipients: [{ address: recipient, amountSats: sats }],
+              senderAddress: fromAddr
+            });
+            txid = xresp && xresp.result && xresp.result.txid;
+          }
+        }
+        if (!txid) throw new Error('sendBitcoin returned no txid');
+
+      // ══════════════════════════════════════════════════════
+      //  CASE 2: OP-20 Token transfer
+      // ══════════════════════════════════════════════════════
+      } else {
+        var contractAddr = TOKEN_CONTRACTS[token];
+        if (!contractAddr) throw new Error('Unknown token contract for ' + token);
+
+        var decimals = (TOKEN_META[token] && TOKEN_META[token].decimals) || 8;
+
+        // Encode transfer(address,uint256) calldata
+        // selector: 0xa9059cbb
+        var toBytes   = addrToCalldata(recipient);
+        var amtBytes  = amountToHex32(amount, decimals);
+        var calldata  = '0xa9059cbb' + toBytes + amtBytes;
+
+        var wType2 = getWalletType();
+
+        // Try wallet-native contract call first
+        if (wType2 === 'opwallet' || wType2 === 'unisat') {
+          // OP_NET wallet: use sendBitcoin for OP-20 via contract interaction
+          // Some versions support eth_sendTransaction style
+          if (typeof provider.sendTransaction === 'function') {
+            txid = await provider.sendTransaction({
+              to:   contractAddr,
+              data: calldata
+            });
+          } else if (typeof provider.contractCall === 'function') {
+            txid = await provider.contractCall({
+              contractAddress: contractAddr,
+              method: 'transfer',
+              params: [recipient, String(Math.round(amount * Math.pow(10, decimals)))]
+            });
+          } else {
+            // Fallback: broadcast via RPC directly
+            txid = await _broadcastOP20Transfer(contractAddr, calldata, fromAddr);
+          }
+        } else if (wType2 === 'okx') {
+          txid = await window.okxwallet.bitcoin.contractInteraction({
+            contractAddress: contractAddr,
+            method: 'transfer',
+            params: [recipient, String(Math.round(amount * Math.pow(10, decimals)))]
+          });
+        } else {
+          txid = await _broadcastOP20Transfer(contractAddr, calldata, fromAddr);
+        }
+
+        if (!txid) throw new Error('Token transfer returned no txid');
       }
-    }, 3000);
 
-    // Reset form setelah 4 detik
-    setTimeout(() => {
+      // ── SUCCESS ──
+      var txUrl = MEMPOOL_TX + txid;
+      sendShowStatus(
+        '✅ Sent! <a href="' + txUrl + '" target="_blank" rel="noopener" style="color:#f7931a;font-weight:700">'
+        + txid.slice(0, 10) + '...' + txid.slice(-6) + ' ↗</a>',
+        '#00ff88'
+      );
+
+      // Save to history
+      var now = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      if (window._sendHistory) {
+        window._sendHistory.unshift({
+          time: now, token: token, amount: amount,
+          to: recipient, status: 'confirmed', txid: txid
+        });
+        if (typeof window.sendRenderHistory === 'function') sendRenderHistory();
+      }
+
+      // Save to Storage/localStorage
+      if (window.Storage && typeof window.Storage.addLocalTx === 'function') {
+        window.Storage.addLocalTx({
+          hash: txid, type: 'send', token: token,
+          amount: amount, address: fromAddr,
+          timestamp: Date.now(), status: 'pending'
+        });
+      }
+
+      // Reset form after 4s
+      setTimeout(function () {
+        if (btn) { btn.disabled = false; btn.textContent = '📤 Send'; }
+        if (amountEl) amountEl.value = '';
+        if (recipientEl) recipientEl.value = '';
+        var se = document.getElementById('send-status');
+        if (se) se.style.display = 'none';
+        var pe = document.getElementById('send-preview');
+        if (pe) pe.style.display = 'none';
+      }, 4000);
+
+      // Refresh balances
+      setTimeout(window._syncSendBalances, 3000);
+
+    } catch (err) {
+      console.error('[sendSubmit]', err);
+      sendShowStatus('❌ ' + (err.message || 'Transaction failed'), '#ff4466');
       if (btn) { btn.disabled = false; btn.textContent = '📤 Send'; }
-      const ae = document.getElementById('send-amount');
-      const re = document.getElementById('send-recipient');
-      const pe = document.getElementById('send-preview');
-      if (ae) ae.value = '';
-      if (re) re.value = '';
-      if (pe) pe.style.display = 'none';
-    }, 4000);
-
-  } catch (err) {
-    console.error('[Send] Error:', err);
-    sendShowStatus('❌ ' + (err.message || 'Transaksi gagal'), '#ff4466');
-    if (btn) { btn.disabled = false; btn.textContent = '📤 Send'; }
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Update balance display saat token dipilih
-// ─────────────────────────────────────────────────────────────────────────────
-function sendSelectToken(tok) {
-  _sendSelectedToken = tok;
-  _syncSendBalances(); // Sync dulu dari data terbaru
-
-  document.querySelectorAll('.send-tok-btn').forEach(function(el) {
-    var t = el.getAttribute('data-tok');
-    if (t === tok) {
-      el.style.background  = 'rgba(247,147,26,0.18)';
-      el.style.borderColor = 'var(--orange)';
-      el.querySelector('div:last-child').style.color = 'var(--orange)';
-    } else {
-      el.style.background  = 'rgba(247,147,26,0.05)';
-      el.style.borderColor = 'var(--border)';
-      el.querySelector('div:last-child').style.color = 'var(--text-dim)';
     }
-  });
+  };
 
-  const lbl = document.getElementById('send-token-label');
-  const bal = document.getElementById('send-balance');
-  const cn  = document.getElementById('send-contract-token-name');
-  if (lbl) lbl.textContent = tok;
-  if (bal) bal.textContent = (_sendBalances[tok] || '0') + ' ' + tok;
-  if (cn)  cn.textContent  = tok;
-
-  sendFillContract();
-  sendUpdatePreview();
-}
-
-function sendFillContract() {
-  const el = document.getElementById('send-contract');
-  if (el) el.value = _sendContracts[_sendSelectedToken] || '';
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Render history transaksi (tampilkan link ke explorer)
-// ─────────────────────────────────────────────────────────────────────────────
-function sendRenderHistory() {
-  const list = document.getElementById('send-history-list');
-  if (!list) return;
-  if (!_sendHistory.length) {
-    list.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text-muted);font-size:12px"><div style="font-size:32px;margin-bottom:8px">📭</div>Belum ada history</div>';
-    return;
+  // Fallback OP-20 broadcast via raw RPC
+  async function _broadcastOP20Transfer(contractAddr, calldata, fromAddr) {
+    // Try OP_NET eth_sendTransaction (unsigned, wallet signs internally)
+    var result = await rpcCall('eth_sendTransaction', [{
+      from: fromAddr,
+      to:   contractAddr,
+      data: calldata,
+      gas:  '0x15F90' // 90000
+    }]);
+    return result;
   }
-  list.innerHTML = _sendHistory.slice(0, 10).map(function(h) {
-    const explorerLink = h.txid && !h.txid.startsWith('pending')
-      ? `<a href="https://mempool.space/testnet4/tx/${h.txid}" target="_blank" style="color:var(--orange);font-size:10px">View ↗</a>`
-      : `<span style="color:var(--text-muted);font-size:10px">pending...</span>`;
-    return `<div style="display:grid;grid-template-columns:auto 1fr auto auto;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);font-size:12px">
-      <div style="font-size:20px">📤</div>
-      <div>
-        <div style="font-weight:600;color:var(--text)">${h.amount} ${h.token}</div>
-        <div style="font-size:10px;color:var(--text-muted)">→ ${h.to.slice(0,8)}...${h.to.slice(-4)}</div>
-      </div>
-      ${explorerLink}
-      <div style="color:var(--text-muted);font-size:10px">${h.time}</div>
-    </div>`;
-  }).join('');
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Init saat DOM ready
-// ─────────────────────────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', function() {
-  const ri = document.getElementById('send-recipient');
-  const ai = document.getElementById('send-amount');
+  // ─────────────────────────────────────────────────────────
+  //  HELPER: sendShowStatus (safe wrapper)
+  // ─────────────────────────────────────────────────────────
+  if (typeof window.sendShowStatus !== 'function') {
+    window.sendShowStatus = function(msg, color) {
+      var el = document.getElementById('send-status');
+      if (!el) return;
+      el.style.display = 'block';
+      el.style.color   = color || '#ffffff';
+      el.innerHTML     = msg;
+    };
+  }
 
-  // Tambah live validator alamat
-  if (ri) ri.addEventListener('input', function() {
-    const v   = ri.value.trim();
-    const hint = document.getElementById('send-addr-hint');
-    if (!v) {
-      if (hint) { hint.textContent = '⚡ Masukkan alamat Bitcoin testnet yang valid'; hint.style.color = 'var(--text-muted)'; }
-    } else if (v.startsWith('tb1') || v.startsWith('m') || v.startsWith('n') || v.startsWith('2')) {
-      if (hint) { hint.textContent = '✅ Alamat valid (Bitcoin testnet)'; hint.style.color = '#00ff88'; }
-    } else if (v.startsWith('bc1') || v.startsWith('1') || v.startsWith('3')) {
-      if (hint) { hint.textContent = '❌ Ini alamat mainnet! Harus alamat testnet (tb1...)'; hint.style.color = '#ff4466'; }
-    } else {
-      if (hint) { hint.textContent = '⚠️ Format alamat tidak dikenal'; hint.style.color = '#ffaa00'; }
+  // ─────────────────────────────────────────────────────────
+  //  INIT — called on wallet connect + DOMContentLoaded
+  // ─────────────────────────────────────────────────────────
+  function _init() {
+    // Override _sendContracts with real addresses
+    window._sendContracts = window._sendContracts || {};
+    Object.keys(TOKEN_CONTRACTS).forEach(function(sym) {
+      window._sendContracts[sym] = TOKEN_CONTRACTS[sym] || 'native';
+    });
+
+    // Sync balances if wallet already connected
+    if (window.Wallet && window.Wallet.state && window.Wallet.state.connected) {
+      window._syncSendBalances();
     }
-    sendUpdatePreview();
-  });
 
-  if (ai) ai.addEventListener('input', sendUpdatePreview);
+    // Listen for wallet connect event
+    if (window.Wallet && typeof window.Wallet.on === 'function') {
+      window.Wallet.on('connect', function() {
+        setTimeout(window._syncSendBalances, 800);
+      });
+    } else {
+      // Fallback: poll for wallet connection
+      var pollCount = 0;
+      var poll = setInterval(function() {
+        pollCount++;
+        if ((window.Wallet && window.Wallet.state && window.Wallet.state.connected) || pollCount > 30) {
+          clearInterval(poll);
+          if (window.Wallet && window.Wallet.state && window.Wallet.state.connected) {
+            window._syncSendBalances();
+          }
+        }
+      }, 1000);
+    }
+  }
 
-  sendFillContract();
-  sendSelectToken('tBTC');
-});
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _init);
+  } else {
+    setTimeout(_init, 100);
+  }
 
-// Sync balance saat wallet connect
-if (window.Wallet) {
-  Wallet.on('connect', function(data) {
-    setTimeout(_syncSendBalances, 1000); // Tunggu OPNetTokens selesai fetch
-  });
-  Wallet.on('balance', function() {
-    _syncSendBalances();
-  });
-}
+  console.log('[send_patch.js] ✅ Loaded — real TX + real balances + multi-network token search');
+
+})();

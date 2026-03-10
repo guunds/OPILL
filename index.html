@@ -7831,11 +7831,11 @@ function updateMintPrice() {
 var _sendSelectedToken = 'tBTC';
 var _sendContracts = {
   'tBTC':  'Native tBTC (OP_NET Testnet4)',
-  'PILL':  '0x1234...PILL_CONTRACT_ADDRESS',
-  'MOTO':  '0x5678...MOTO_CONTRACT_ADDRESS',
-  'OPILL': '0x9abc...OPILL_CONTRACT_ADDRESS'
+  'PILL':  '0xb09fc29c112af8293539477e23d8df1d3126639642767d707277131352040cbb',
+  'MOTO':  '0xfd4473840751d58d9f8b73bdd57d6c5260453d5518bd7cd02d0a4cf3df9bf4dd',
+  'OPILL': '0xe3e58e9615ac3e8a29a316c64b8c5930600941096377e227cc456bebb7daf3ee'
 };
-var _sendBalances = { 'tBTC': '0.00420', 'PILL': '10000', 'MOTO': '500', 'OPILL': '2500' };
+var _sendBalances = { 'tBTC': '—', 'PILL': '—', 'MOTO': '—', 'OPILL': '—' }; // filled live by _syncSendBalances()
 var _sendHistory  = [];
 
 function sendSelectToken(tok) {
@@ -8045,10 +8045,10 @@ document.addEventListener('DOMContentLoaded', function() {
 <script>
 // ── Send Token Search ──
 var _sendTokenList = [
-  { sym: 'tBTC',  name: 'Testnet Bitcoin',   addr: 'native',                              icon: '₿',    color: '#f7931a' },
-  { sym: 'PILL',  name: 'PILL Token',         addr: '0x1234...PILL_CONTRACT_ADDRESS',      icon: '💊',   color: '#f7931a' },
-  { sym: 'MOTO',  name: 'MOTO Token',         addr: '0x5678...MOTO_CONTRACT_ADDRESS',      icon: '🏍️',  color: '#c084fc' },
-  { sym: 'OPILL', name: 'OPiLL Protocol',     addr: '0x9abc...OPILL_CONTRACT_ADDRESS',     icon: '🟠',   color: '#f7931a' },
+  { sym: 'tBTC',  name: 'Testnet Bitcoin',   addr: 'native',                                                                               icon: '₿',    color: '#f7931a' },
+  { sym: 'PILL',  name: 'PILL Token',         addr: '0xb09fc29c112af8293539477e23d8df1d3126639642767d707277131352040cbb',                   icon: '💊',   color: '#00e5ff' },
+  { sym: 'MOTO',  name: 'MOTO Token',         addr: '0xfd4473840751d58d9f8b73bdd57d6c5260453d5518bd7cd02d0a4cf3df9bf4dd',                  icon: '🏍️',  color: '#c084fc' },
+  { sym: 'OPILL', name: 'OPiLL Protocol',     addr: '0xe3e58e9615ac3e8a29a316c64b8c5930600941096377e227cc456bebb7daf3ee',                  icon: '🟠',   color: '#00ff88' },
 ];
 
 function sendSearchToken(val) {
