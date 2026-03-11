@@ -1824,32 +1824,104 @@ async function nftMintConfirm() {
   var collName = _mintNftNames[collKey] || 'OPiLL Genesis';
   var recipientInput = document.getElementById('mint-recipient');
   var recipient = (recipientInput && recipientInput.value.trim()) || Wallet.state.address;
+  var fromAddr = Wallet.state.address;
+
   if (!recipient || !/^(bc1|tb1|1|3|m|n|2)[a-zA-Z0-9]{6,}$/.test(recipient)) {
-    if (!Wallet.state.address) { showToast('⚠️ Invalid address','error'); return; }
-    recipient = Wallet.state.address;
+    if (!fromAddr) { showToast('⚠️ Invalid address','error'); return; }
+    recipient = fromAddr;
   }
   var confirmBtn = document.getElementById('mint-confirm-btn');
   var statusEl   = document.getElementById('mint-status');
-  if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = '⏳ Signing...'; }
-  _statusEl(statusEl, 'info', '📝 Sign the mint transaction in your wallet...');
+  if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = '⏳ Building mint...'; }
+  _statusEl(statusEl, 'info', '🔨 Building mint transaction via backend...');
   statusEl.style.display = 'block';
+
   try {
-    var msg = 'OPiLL Mint | ' + collName + ' | to:' + recipient + ' | ' + _mintNftPrices[collKey] + ' | Testnet4 | ts:' + Date.now();
-    var sig = await Wallet.signMessage(msg);
-    if (!sig) throw new Error('Signature rejected');
-    _statusEl(statusEl, 'info', '⏳ Minting on Testnet4...');
-    if (confirmBtn) confirmBtn.textContent = '⏳ Minting...';
-    await new Promise(function(r){ setTimeout(r, 2000); });
-    var txid = Array.from({length:64},function(){return '0123456789abcdef'[Math.floor(Math.random()*16)];}).join('');
+    // ── Map collection key → NFT contract ────────────────────
+    // Ganti dengan contract address asli kalau sudah deploy
+    var NFT_CONTRACTS = {
+      'opill':    (window._OPILL_NFT_CONTRACTS && window._OPILL_NFT_CONTRACTS.opill)    || null,
+      'moto':     (window._OPILL_NFT_CONTRACTS && window._OPILL_NFT_CONTRACTS.moto)     || null,
+      'og_opill': (window._OPILL_NFT_CONTRACTS && window._OPILL_NFT_CONTRACTS.og_opill) || null,
+      'pill':     (window._OPILL_NFT_CONTRACTS && window._OPILL_NFT_CONTRACTS.pill)     || null,
+    };
+    var nftContract = NFT_CONTRACTS[collKey];
+
+    // ── STEP 1: build PSBT dari backend ──────────────────────
+    var buildResult = await window._buildMintTx(nftContract, fromAddr, recipient, null);
+
+    if (!buildResult || !buildResult.success) {
+      var errMsg = buildResult && buildResult.error ? buildResult.error : 'Build mint failed';
+      if (errMsg.indexOf('sync') !== -1 || errMsg.indexOf('503') !== -1) {
+        // Backend/Bitcoin Core belum siap → demo mode
+        _statusEl(statusEl, 'info', '⚠️ Backend belum ready (Bitcoin Core sync). Running demo mode...');
+        if (confirmBtn) confirmBtn.textContent = '⏳ Demo minting...';
+        await new Promise(function(r){ setTimeout(r, 1500); });
+        var txid = Array.from({length:64},function(){return '0123456789abcdef'[Math.floor(Math.random()*16)];}).join('');
+        var nftNum = '#' + String(Math.floor(Math.random()*9000)+1000);
+        _statusEl(statusEl, 'success', '🔶 DEMO · ' + collName + ' ' + nftNum + ' · Sync BTC node to go live!');
+        showToast('🎨 Demo mint: ' + collName + ' ' + nftNum, 'success');
+        var box = document.getElementById('mint-preview-box');
+        var btn = document.getElementById('mint-btn');
+        if (box) box.style.display = 'none';
+        if (btn) btn.style.display = 'block';
+        if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.textContent = '✓ Confirm Mint'; }
+        return;
+      }
+      throw new Error(errMsg);
+    }
+
+    // ── STEP 2: user sign PSBT ────────────────────────────────
+    _statusEl(statusEl, 'info', '📝 Sign PSBT in your wallet... Fee: ' + (buildResult.fee || '?') + ' sats');
+    if (confirmBtn) confirmBtn.textContent = '⏳ Waiting for signature...';
+
+    var psbtBase64 = buildResult.psbt;
+    var signedHex  = null;
+
+    var walletProvider = window.opnet || window.unisat || window.xverse || null;
+    if (walletProvider && typeof walletProvider.signPsbt === 'function') {
+      var signedPsbt = await walletProvider.signPsbt(psbtBase64);
+      signedHex = typeof signedPsbt === 'string' ? signedPsbt : signedPsbt.hex || signedPsbt;
+    } else if (window.Wallet && typeof window.Wallet.signPsbt === 'function') {
+      var signedPsbt = await window.Wallet.signPsbt(psbtBase64);
+      signedHex = typeof signedPsbt === 'string' ? signedPsbt : signedPsbt.hex || signedPsbt;
+    } else {
+      // Fallback sign message
+      var msg = 'OPiLL Mint | ' + collName + ' | to:' + recipient + ' | ' + _mintNftPrices[collKey] + ' | Testnet4 | ts:' + Date.now();
+      var sig = await Wallet.signMessage(msg);
+      if (!sig) throw new Error('Signature rejected');
+      signedHex = psbtBase64;
+    }
+
+    // ── STEP 3: broadcast ─────────────────────────────────────
+    _statusEl(statusEl, 'info', '📡 Broadcasting mint transaction...');
+    if (confirmBtn) confirmBtn.textContent = '⏳ Broadcasting...';
+
+    var broadcastResult = await window._broadcastTx(signedHex);
+    if (!broadcastResult || !broadcastResult.success) {
+      throw new Error(broadcastResult && broadcastResult.error ? broadcastResult.error : 'Broadcast failed');
+    }
+
+    var txid = broadcastResult.txid;
     var nftNum = '#' + String(Math.floor(Math.random()*9000)+1000);
-    _statusEl(statusEl, 'success', '✅ Minted ' + collName + ' ' + nftNum + ' · TX:' + txid.slice(0,12) + '...');
+    var explorerUrl = broadcastResult.explorerUrl || ('https://mempool.space/testnet4/tx/' + txid);
+
+    _statusEl(statusEl, 'success',
+      '✅ Minted ' + collName + ' ' + nftNum +
+      ' · <a href="' + explorerUrl + '" target="_blank" rel="noopener" style="color:#00ff88">TX ↗</a>'
+    );
     showToast('🎨 NFT minted! ' + collName + ' ' + nftNum, 'success');
+
     var box = document.getElementById('mint-preview-box');
-    var btn = document.getElementById('mint-btn');
+    var btnEl = document.getElementById('mint-btn');
     if (box) box.style.display = 'none';
-    if (btn) { btn.style.display = 'block'; }
+    if (btnEl) btnEl.style.display = 'block';
     if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.textContent = '✓ Confirm Mint'; }
     if (recipientInput) recipientInput.value = '';
+
+    // Refresh balance setelah 5 detik
+    setTimeout(function() { if (window.WA && WA.fetchAll) WA.fetchAll(); }, 5000);
+
   } catch(err) {
     var m = err.message || 'Mint failed';
     if (/reject|cancel|denied/i.test(m)) m = 'Rejected by user';
@@ -5990,6 +6062,8 @@ function _faucetAddRecentRow(addr, amount, token) {
     OPSCAN_TX:    'https://opscan.org/tx/',
     BTC_PRICE:    97000, // fallback price, updated from API
 
+    // Contract addresses — sinkron dengan backend .env
+    // OPILL, PILL, MOTO contracts di OP_NET Testnet4
     TOKENS: {
       opill: { name:'OPILL', sc:'0xe3e58e9615ac3e8a29a316c64b8c5930600941096377e227cc456bebb7daf3ee', color:'#00ff88',   price: 4.82  },
       pill:  { name:'PILL',  sc:'0xb09fc29c112af8293539477e23d8df1d3126639642767d707277131352040cbb', color:'#00e5ff',   price: 0.0009 },
@@ -7243,61 +7317,237 @@ function _faucetAddRecentRow(addr, amount, token) {
 
 <script>
 // ═══════════════════════════════════════════════════════════════
-//  OPNet REAL BALANCE FIX — Override _fetchTokenBalance
+//  OPiLL BACKEND ENGINE v2.0
+//  Semua API calls → backend lokal (Node.js di ngrok / localhost)
+//  Endpoints sinkron dengan index.js v2.0
 // ═══════════════════════════════════════════════════════════════
 (function() {
   'use strict';
-  var OPNET_API  = 'https://shotten-bently-skulkingly.ngrok-free.app';
-  var MEMPOOL    = 'https://mempool.opnet.org/testnet4/api';
-  var TIMEOUT_MS = 10000;
 
-  function fetchJson(url, opts) {
+  // ── Backend URL: ganti dengan ngrok URL kamu saat ini ────────
+  // Contoh: 'https://shotten-bently-skulkingly.ngrok-free.dev'
+  // Atau pakai '' (kosong) kalau frontend & backend di-serve bareng
+  var BACKEND = (function() {
+    // Auto-detect: kalau di Vercel, pakai ngrok URL dari localStorage atau hardcode
+    var stored = (typeof localStorage !== 'undefined') && localStorage.getItem('opill_backend_url');
+    if (stored) return stored;
+    // Default: ngrok URL kamu — GANTI KALAU NGROK URL BERUBAH
+    return 'https://shotten-bently-skulkingly.ngrok-free.dev';
+  })();
+
+  var MEMPOOL_API = 'https://mempool.opnet.org/testnet4/api';
+  var TIMEOUT_MS  = 12000;
+
+  // Expose backend URL globally supaya bisa diupdate dari console
+  window._OPILL_BACKEND = BACKEND;
+  window._setBackendUrl = function(url) {
+    window._OPILL_BACKEND = url;
+    if (typeof localStorage !== 'undefined') localStorage.setItem('opill_backend_url', url);
+    console.log('[OPiLL] Backend URL diupdate ke:', url);
+  };
+
+  // ── Generic fetch helper ─────────────────────────────────────
+  function apiFetch(path, opts) {
+    var url = window._OPILL_BACKEND + path;
     return Promise.race([
-      fetch(url, opts || {}).then(function(r){ return r.json(); }),
-      new Promise(function(_, rej){ setTimeout(function(){ rej(new Error('timeout')); }, TIMEOUT_MS); })
+      fetch(url, opts || {}).then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      }),
+      new Promise(function(_, rej) {
+        setTimeout(function() { rej(new Error('timeout')); }, TIMEOUT_MS);
+      })
     ]);
   }
 
+  // ── GET token balance via backend ────────────────────────────
   async function opnetBalanceOf(contractAddr, walletAddr) {
     try {
-      // Use backend REST endpoint: /api/token/:contract/balance/:addr
-      var resp = await fetchJson(
-        OPNET_API + '/api/token/' + encodeURIComponent(contractAddr) + '/balance/' + encodeURIComponent(walletAddr)
+      var resp = await apiFetch(
+        '/api/token/' + encodeURIComponent(contractAddr) +
+        '/balance/'   + encodeURIComponent(walletAddr)
       );
       if (resp && resp.balance !== undefined && resp.balance !== null) {
         var val = parseFloat(resp.balance);
         if (!isNaN(val)) return val;
       }
+    } catch(e) {
+      console.warn('[OPiLL] Balance fetch gagal:', e.message);
+    }
+    return null;
+  }
+
+  // ── GET semua token balances sekaligus ───────────────────────
+  async function fetchAllTokens(walletAddr) {
+    try {
+      var resp = await apiFetch('/api/wallet/' + encodeURIComponent(walletAddr) + '/tokens');
+      if (resp && resp.tokens) return resp.tokens;
     } catch(e) {}
     return null;
   }
 
+  // ── GET BTC balance via backend ──────────────────────────────
+  async function fetchBtcBalance(walletAddr) {
+    try {
+      var resp = await apiFetch('/api/balance/' + encodeURIComponent(walletAddr));
+      if (resp && resp.btc !== undefined) return { btc: resp.btc, sats: resp.sats };
+    } catch(e) {}
+    return null;
+  }
+
+  // ── GET fee rate via backend ─────────────────────────────────
+  async function fetchFeeRate() {
+    try {
+      var resp = await apiFetch('/api/fee');
+      if (resp && resp.halfHour) return resp;
+    } catch(e) {}
+    return { fastest: 20, halfHour: 10, hour: 5 };
+  }
+
+  // ── GET block number via mempool ─────────────────────────────
   async function opnetBlockNumber() {
     try {
-      var h = await fetchJson(MEMPOOL+'/blocks/tip/height');
+      var h = await Promise.race([
+        fetch(MEMPOOL_API + '/blocks/tip/height').then(function(r){ return r.json(); }),
+        new Promise(function(_, rej){ setTimeout(function(){ rej(new Error('t')); }, 5000); })
+      ]);
       if (typeof h === 'number') return h;
     } catch(e) {}
     return null;
   }
 
-  var waited=0;
-  var iv=setInterval(function(){
-    waited+=100;
+  // ── POST broadcast signed tx ─────────────────────────────────
+  window._broadcastTx = async function(hexOrPsbt) {
+    try {
+      var resp = await apiFetch('/api/broadcast', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ hex: hexOrPsbt })
+      });
+      return resp; // { success, txid, explorerUrl }
+    } catch(e) {
+      return { success: false, error: e.message };
+    }
+  };
+
+  // ── POST build send-token transaction ────────────────────────
+  // Returns { psbt, fee, feeRate } → user signs with wallet → broadcast
+  window._buildSendTx = async function(contract, fromAddr, toAddr, amount, feeRate) {
+    try {
+      var resp = await apiFetch('/api/token/build-send', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          contract:    contract,
+          fromAddress: fromAddr,
+          toAddress:   toAddr,
+          amount:      amount,
+          feeRate:     feeRate || null
+        })
+      });
+      return resp;
+    } catch(e) {
+      return { success: false, error: e.message };
+    }
+  };
+
+  // ── POST build mint NFT transaction ──────────────────────────
+  window._buildMintTx = async function(contract, fromAddr, toAddr, feeRate) {
+    try {
+      var resp = await apiFetch('/api/nft/build-mint', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          contract:    contract || null,
+          fromAddress: fromAddr,
+          toAddress:   toAddr  || null,
+          feeRate:     feeRate || null
+        })
+      });
+      return resp;
+    } catch(e) {
+      return { success: false, error: e.message };
+    }
+  };
+
+  // ── GET backend health ───────────────────────────────────────
+  window._checkBackendHealth = async function() {
+    try {
+      var resp = await apiFetch('/api/health');
+      console.log('[OPiLL Backend Health]', resp);
+      return resp;
+    } catch(e) {
+      console.warn('[OPiLL] Backend tidak bisa diakses:', e.message);
+      return null;
+    }
+  };
+
+  // ── Expose fee helper globally ───────────────────────────────
+  window._getFeeRate = fetchFeeRate;
+
+  // ── PATCH WA engine ──────────────────────────────────────────
+  var waited = 0;
+  var iv = setInterval(function() {
+    waited += 100;
     if (!window.WA || typeof WA._fetchTokenBalance !== 'function') {
-      if (waited>=8000) clearInterval(iv);
+      if (waited >= 10000) clearInterval(iv);
       return;
     }
     clearInterval(iv);
-    WA._fetchBlockNumber = async function(){ return await opnetBlockNumber(); };
+
+    // Override block number fetcher
+    WA._fetchBlockNumber = async function() {
+      return await opnetBlockNumber();
+    };
+
+    // Override token balance fetcher → pakai backend REST
     WA._fetchTokenBalance = async function(tokenKey) {
       var tok = WA.TOKENS[tokenKey];
       if (!tok || !WA.addr) return;
       var bal = await opnetBalanceOf(tok.sc, WA.addr);
-      if (bal !== null) { WA._setBalance(tokenKey, bal, null); WA._setStatus(tokenKey, true); }
-      else { WA._setBalance(tokenKey, 0, null); WA._setStatus(tokenKey, false); }
+      if (bal !== null) {
+        WA._setBalance(tokenKey, bal, null);
+        WA._setStatus(tokenKey, true);
+      } else {
+        WA._setBalance(tokenKey, 0, null);
+        WA._setStatus(tokenKey, false);
+      }
     };
-    if (WA.addr) setTimeout(function(){ WA.fetchAll(); }, 300);
-    console.log('[OPNet Fix] Balance engine patched ✓');
+
+    // Override BTC balance fetcher → pakai backend
+    var _origFetchBTC = WA._fetchBTCBalance;
+    WA._fetchBTCBalance = async function() {
+      if (!WA.addr) return;
+      var result = await fetchBtcBalance(WA.addr);
+      if (result && result.sats !== undefined) {
+        WA._setBalance('btc', result.sats / 1e8, null);
+        WA._setMemStatus(true, 'Connected');
+      } else if (typeof _origFetchBTC === 'function') {
+        await _origFetchBTC.call(WA);
+      }
+    };
+
+    if (WA.addr) setTimeout(function() { WA.fetchAll(); }, 300);
+
+    // Auto health check saat startup
+    setTimeout(function() {
+      window._checkBackendHealth().then(function(h) {
+        if (h && h.bitcoin_core) {
+          var btc = h.bitcoin_core;
+          console.log('[Bitcoin Core] Sync: ' + btc.sync_progress +
+            ' | Blocks: ' + btc.blocks +
+            ' | Synced: ' + btc.synced);
+          if (!btc.synced) {
+            console.warn('[OPiLL] ⚠️  Bitcoin Core belum sync ' + btc.sync_progress +
+              ' — send/mint belum bisa sampai 100%');
+          } else {
+            console.log('[OPiLL] 🎉 Bitcoin Core FULLY SYNCED — siap broadcast!');
+          }
+        }
+      });
+    }, 2000);
+
+    console.log('[OPiLL] Backend engine v2.0 aktif ✓ | Backend:', window._OPILL_BACKEND);
   }, 100);
 })();
 </script>
@@ -7968,8 +8218,9 @@ async function sendSubmit() {
   var recipient = (document.getElementById('send-recipient') || {}).value || '';
   var amount    = parseFloat((document.getElementById('send-amount') || {}).value || '0');
   var contract  = (document.getElementById('send-contract') || {}).value || '';
+  var fromAddr  = window.Wallet && window.Wallet.state && window.Wallet.state.address;
 
-  if (!window.Wallet || !window.Wallet.state || !window.Wallet.state.address) {
+  if (!fromAddr) {
     sendShowStatus('⚠️ Connect wallet first!', '#ff4466'); return;
   }
   if (!recipient) {
@@ -7980,20 +8231,103 @@ async function sendSubmit() {
   }
 
   var btn = document.getElementById('send-btn');
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ Mengirim...'; }
-  sendShowStatus('📝 Sign transaction in your wallet...', '#f7931a');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Building tx...'; }
+
+  // ── STEP 1: cek apakah ini BTC atau OP-20 token ──
+  var isBtc = (_sendSelectedToken === 'tBTC' || !contract);
 
   try {
-    var msg = 'OPiLL Send | ' + _sendSelectedToken + ' | ' + amount + ' | to: ' + recipient + ' | from: ' + window.Wallet.state.address + ' | ts:' + Date.now();
-    var sig = await window.Wallet.signMessage(msg);
-    if (!sig) throw new Error('Signature cancelled');
+    var txid = null;
 
-    sendShowStatus('✅ Transaction sent! Awaiting confirmation...', '#00ff88');
+    if (isBtc) {
+      // ── BTC send: sign langsung via wallet ──
+      sendShowStatus('📝 Sign BTC transaction in your wallet...', '#f7931a');
+      if (btn) btn.textContent = '⏳ Waiting for wallet...';
+
+      // Coba sendBitcoin kalau wallet support
+      var walletProvider = window.opnet || window.unisat || window.xverse || null;
+      if (walletProvider && typeof walletProvider.sendBitcoin === 'function') {
+        var sats = Math.round(amount * 1e8);
+        txid = await walletProvider.sendBitcoin(recipient, sats);
+      } else {
+        // Fallback: sign message sebagai bukti intent (demo mode kalau wallet tidak support)
+        var msg = 'OPiLL BTC Send | ' + amount + ' tBTC | to:' + recipient + ' | from:' + fromAddr + ' | ts:' + Date.now();
+        var sig = await window.Wallet.signMessage(msg);
+        if (!sig) throw new Error('Signature cancelled');
+        txid = 'signed-' + Date.now(); // placeholder
+        sendShowStatus('✅ Signed! (Broadcast requires Bitcoin Core sync 100%)', '#ffb347');
+      }
+
+    } else {
+      // ── OP-20 Token send: build → sign PSBT → broadcast ──
+      sendShowStatus('🔨 Building transaction via backend...', '#f7931a');
+      if (btn) btn.textContent = '⏳ Building...';
+
+      // Step 1: build PSBT dari backend
+      var buildResult = await window._buildSendTx(contract, fromAddr, recipient, amount, null);
+      if (!buildResult || !buildResult.success) {
+        var errMsg = buildResult && buildResult.error ? buildResult.error : 'Build transaction failed';
+        // Cek apakah error karena belum sync
+        if (errMsg.indexOf('sync') !== -1 || errMsg.indexOf('503') !== -1) {
+          throw new Error('⚠️ Bitcoin Core belum sync 100%. Tunggu sync selesai. Cek di /api/health');
+        }
+        throw new Error(errMsg);
+      }
+
+      sendShowStatus('📝 Sign PSBT in your wallet... Fee: ' + (buildResult.fee || '?') + ' sats', '#f7931a');
+      if (btn) btn.textContent = '⏳ Waiting for signature...';
+
+      // Step 2: user sign PSBT di wallet
+      var psbtBase64 = buildResult.psbt;
+      var signedHex  = null;
+
+      var walletProvider = window.opnet || window.unisat || window.xverse || null;
+      if (walletProvider && typeof walletProvider.signPsbt === 'function') {
+        var signedPsbt = await walletProvider.signPsbt(psbtBase64);
+        signedHex = typeof signedPsbt === 'string' ? signedPsbt : signedPsbt.hex || signedPsbt;
+      } else if (window.Wallet && typeof window.Wallet.signPsbt === 'function') {
+        var signedPsbt = await window.Wallet.signPsbt(psbtBase64);
+        signedHex = typeof signedPsbt === 'string' ? signedPsbt : signedPsbt.hex || signedPsbt;
+      } else {
+        // Fallback sign message
+        var msg2 = 'OPiLL Token Send|' + _sendSelectedToken + '|' + amount + '|to:' + recipient + '|ts:' + Date.now();
+        var sig2 = await window.Wallet.signMessage(msg2);
+        if (!sig2) throw new Error('Signature cancelled');
+        signedHex = psbtBase64; // broadcast PSBT as-is (beberapa wallet sudah finalize)
+      }
+
+      sendShowStatus('📡 Broadcasting transaction...', '#f7931a');
+      if (btn) btn.textContent = '⏳ Broadcasting...';
+
+      // Step 3: broadcast
+      var broadcastResult = await window._broadcastTx(signedHex);
+      if (!broadcastResult || !broadcastResult.success) {
+        throw new Error(broadcastResult && broadcastResult.error ? broadcastResult.error : 'Broadcast failed');
+      }
+      txid = broadcastResult.txid;
+    }
+
+    // ── SUCCESS ──
+    var explorerUrl = txid && !txid.startsWith('signed-')
+      ? 'https://mempool.space/testnet4/tx/' + txid
+      : null;
+
+    var statusMsg = '✅ Sent! TX: ' + (txid ? txid.slice(0,12) + '...' : 'pending');
+    if (explorerUrl) {
+      statusMsg += ' <a href="' + explorerUrl + '" target="_blank" rel="noopener" style="color:#00ff88;text-decoration:underline">View ↗</a>';
+    }
+    sendShowStatus(statusMsg, '#00ff88');
 
     // Add to history
     var now = new Date().toLocaleTimeString('id-ID', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-    _sendHistory.unshift({ time: now, token: _sendSelectedToken, amount: amount, to: recipient, status: 'confirmed' });
+    _sendHistory.unshift({
+      time: now, token: _sendSelectedToken, amount: amount,
+      to: recipient, status: 'confirmed', txid: txid
+    });
     sendRenderHistory();
+
+    // Refresh balance setelah 5 detik
+    setTimeout(function() { if (window.WA && WA.fetchAll) WA.fetchAll(); }, 5000);
 
     // Reset form
     setTimeout(function() {
@@ -8006,7 +8340,7 @@ async function sendSubmit() {
       if (se) se.style.display = 'none';
       var pe = document.getElementById('send-preview');
       if (pe) pe.style.display = 'none';
-    }, 3500);
+    }, 5000);
 
   } catch(e) {
     sendShowStatus('❌ ' + (e.message || 'Transaction failed'), '#ff4466');

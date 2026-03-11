@@ -1,0 +1,282 @@
+// opnet.js — OPNet Bitcoin testnet integration (FIXED)
+// Pakai backend lokal sebagai proxy, fallback ke mempool.space
+// Tidak lagi langsung ke testnet.opnet.org (tidak exist)
+
+const OPNet = (() => {
+  // ── Backend lokal kamu (opill-backend) ──────────────────────
+  const BACKEND = 'http://localhost:3001';
+
+  // ── OP_NET RPC — pakai node lokal dulu, fallback regtest ────
+  const OPNET_RPCS = [
+    'http://127.0.0.1:9000',       // Node lokal kamu
+    'https://regtest.opnet.org',   // Public fallback (regtest)
+  ];
+
+  // ── Mempool explorer untuk TX history & balance ─────────────
+  const MEMPOOL = [
+    'https://mempool.space/testnet4',
+    'https://mempool.space/testnet',
+  ];
+
+  let _latestBlock = 0;
+  let _activeRpc   = OPNET_RPCS[0];
+
+  // ── Low-level JSON-RPC ke OP_NET ────────────────────────────
+  async function rpc(method, params = []) {
+    // Coba via backend proxy dulu
+    try {
+      const res = await fetch(`${BACKEND}/api/opnet/rpc`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params })
+      });
+      const data = await res.json();
+      if (data.error && !data.error.includes('tidak tersedia')) {
+        throw new Error(data.error.message || JSON.stringify(data.error));
+      }
+      if (data.result !== undefined) return data.result;
+    } catch {}
+
+    // Direct ke node OP_NET
+    for (const endpoint of OPNET_RPCS) {
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }),
+          signal: AbortSignal.timeout(5000)
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+        _activeRpc = endpoint;
+        return data.result;
+      } catch {}
+    }
+    throw new Error('OP_NET RPC tidak tersedia');
+  }
+
+  // ── REST GET ke OP_NET ───────────────────────────────────────
+  async function rest(path) {
+    for (const endpoint of OPNET_RPCS) {
+      try {
+        const res = await fetch(endpoint + path, { signal: AbortSignal.timeout(5000) });
+        if (res.ok) { _activeRpc = endpoint; return await res.json(); }
+      } catch {}
+    }
+    throw new Error(`OP_NET REST gagal: ${path}`);
+  }
+
+  // ── REST POST ke OP_NET ──────────────────────────────────────
+  async function restPost(path, body) {
+    for (const endpoint of OPNET_RPCS) {
+      try {
+        const res = await fetch(endpoint + path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(5000)
+        });
+        if (res.ok) { _activeRpc = endpoint; return await res.json(); }
+      } catch {}
+    }
+    throw new Error(`OP_NET REST POST gagal: ${path}`);
+  }
+
+  // ── Mempool GET (balance, utxo, tx) ─────────────────────────
+  async function mempoolGet(path) {
+    // Coba via backend lokal dulu
+    try {
+      const res = await fetch(`${BACKEND}${path}`, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) return await res.json();
+    } catch {}
+
+    // Direct ke mempool.space
+    for (const base of MEMPOOL) {
+      try {
+        const res = await fetch(base + path, { signal: AbortSignal.timeout(8000) });
+        if (res.ok) return await res.json();
+      } catch {}
+    }
+    throw new Error(`Mempool API gagal: ${path}`);
+  }
+
+  // ── Block number ─────────────────────────────────────────────
+  async function getBlockNumber() {
+    // Via mempool (paling reliable)
+    try {
+      for (const base of MEMPOOL) {
+        try {
+          const res = await fetch(`${base}/api/blocks/tip/height`);
+          if (res.ok) { _latestBlock = parseInt(await res.text()); return _latestBlock; }
+        } catch {}
+      }
+    } catch {}
+    // Fallback OP_NET RPC
+    try {
+      const r = await rpc('eth_blockNumber');
+      _latestBlock = parseInt(r, 16);
+      return _latestBlock;
+    } catch {}
+    return _latestBlock;
+  }
+
+  // ── Gas price ────────────────────────────────────────────────
+  async function getGasPrice() {
+    try {
+      const fees = await mempoolGet('/api/fee');
+      return fees.fastest || fees.halfHour || 10;
+    } catch {}
+    try {
+      const r = await rpc('eth_gasPrice');
+      return parseInt(r, 16);
+    } catch { return 10; }
+  }
+
+  // ── eth_call ─────────────────────────────────────────────────
+  async function call(contractAddress, data, blockTag = 'latest') {
+    return rpc('eth_call', [{ to: contractAddress, data }, blockTag]);
+  }
+
+  // ── Encode address untuk calldata ────────────────────────────
+  function encodeAddressForCalldata(address) {
+    const bytes = new TextEncoder().encode(address);
+    const hex   = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    return hex.padEnd(64, '0');
+  }
+
+  // ── Balance tBTC dari mempool ────────────────────────────────
+  async function getBTCBalance(address) {
+    try {
+      const data = await mempoolGet(`/api/balance/${address}`);
+      if (data.success) return { sats: data.sats, btc: data.btc };
+    } catch {}
+    // Direct mempool
+    try {
+      for (const base of MEMPOOL) {
+        try {
+          const res = await fetch(`${base}/api/address/${address}`);
+          if (res.ok) {
+            const d = await res.json();
+            const sats = (d.chain_stats.funded_txo_sum || 0) - (d.chain_stats.spent_txo_sum || 0);
+            return { sats, btc: (sats / 1e8).toFixed(8) };
+          }
+        } catch {}
+      }
+    } catch {}
+    return { sats: 0, btc: '0' };
+  }
+
+  // ── Balance OP-20 token ──────────────────────────────────────
+  async function getTokenBalance(tokenContract, walletAddress) {
+    // Method 1: OP_NET REST API
+    try {
+      const data = await rest(`/api/v1/token/${tokenContract}/balance/${walletAddress}`);
+      if (data?.balance !== undefined) return BigInt(data.balance);
+    } catch {}
+
+    // Method 2: eth_call dengan UTF-8 encoded address
+    try {
+      const encoded  = encodeAddressForCalldata(walletAddress);
+      const calldata = '0x70a08231' + encoded;
+      const result   = await call(tokenContract, calldata);
+      if (result && result !== '0x') return BigInt(result);
+    } catch {}
+
+    // Method 3: REST POST
+    try {
+      const data = await restPost(`/api/v1/contract/${tokenContract}/call`, {
+        method: 'balanceOf', params: [walletAddress]
+      });
+      if (data?.result !== undefined) return BigInt(data.result);
+    } catch {}
+
+    return BigInt(0);
+  }
+
+  // ── Token info ───────────────────────────────────────────────
+  async function getTokenInfo(tokenContract) {
+    try { return await rest(`/api/v1/token/${tokenContract}`); }
+    catch { return null; }
+  }
+
+  async function getDecimals(tokenContract) {
+    try { return parseInt(await call(tokenContract, '0x313ce567'), 16) || 8; }
+    catch { return 8; }
+  }
+
+  async function getSymbol(tokenContract) {
+    try {
+      const info = await getTokenInfo(tokenContract);
+      if (info?.symbol) return info.symbol;
+    } catch {}
+    try { return decodeABIString(await call(tokenContract, '0x95d89b41')) || '???'; }
+    catch { return '???'; }
+  }
+
+  async function getName(tokenContract) {
+    try {
+      const info = await getTokenInfo(tokenContract);
+      if (info?.name) return info.name;
+    } catch {}
+    try { return decodeABIString(await call(tokenContract, '0x06fdde03')) || ''; }
+    catch { return ''; }
+  }
+
+  // ── Transaction history ──────────────────────────────────────
+  async function getTransactions(address, limit = 20) {
+    try {
+      const data = await mempoolGet(`/api/transactions/${address}?limit=${limit}`);
+      if (data?.transactions) return data.transactions;
+    } catch {}
+    try {
+      const txs = await rest(`/api/v1/address/${address}/transactions?limit=${limit}`);
+      return txs?.transactions || txs?.txs || txs || [];
+    } catch {}
+    return [];
+  }
+
+  // ── Decode ABI string ────────────────────────────────────────
+  function decodeABIString(hex) {
+    try {
+      const bytes = (hex || '').replace('0x', '');
+      if (bytes.length < 192) return '';
+      const len    = parseInt(bytes.slice(128, 192), 16);
+      const strHex = bytes.slice(192, 192 + len * 2);
+      return strHex.match(/.{2}/g).map(b => String.fromCharCode(parseInt(b, 16))).join('').replace(/\0/g, '');
+    } catch { return ''; }
+  }
+
+  // ── Format & encode units ────────────────────────────────────
+  function formatUnits(val, decimals = 8) {
+    try {
+      const v = typeof val === 'bigint' ? val : BigInt(String(val || '0'));
+      if (v === 0n) return '0';
+      const divisor = 10n ** BigInt(decimals);
+      const int     = v / divisor;
+      const frac    = v % divisor;
+      const fracStr = frac.toString().padStart(decimals, '0').slice(0, 6).replace(/0+$/, '');
+      return fracStr ? `${int}.${fracStr}` : `${int}`;
+    } catch { return '0'; }
+  }
+
+  function encodeAmount(amount, decimals = 8) {
+    const [intPart, fracPart = ''] = String(amount).split('.');
+    const paddedFrac = (fracPart + '0'.repeat(decimals)).slice(0, decimals);
+    return BigInt(intPart) * (10n ** BigInt(decimals)) + BigInt(paddedFrac || 0);
+  }
+
+  return {
+    rpc, rest, restPost, call,
+    getBlockNumber, getGasPrice,
+    getBTCBalance, getTokenBalance,
+    getTokenInfo, getDecimals, getSymbol, getName,
+    getTransactions, formatUnits, encodeAmount,
+    decodeABIString, encodeAddressForCalldata,
+    getCachedBlock: () => _latestBlock,
+    getActiveRpc:   () => _activeRpc,
+    BACKEND, MEMPOOL
+  };
+})();
+
+window.OPNet = OPNet;
+console.log('[OPNet] ✓ Loaded — backend: localhost:3001');
