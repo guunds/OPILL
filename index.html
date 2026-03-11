@@ -793,6 +793,20 @@
         
 
 
+        <!-- ══ CONNECT WALLET PROMPT (shown when not connected) ══ -->
+        <div id="home-connect-prompt" style="margin-bottom:24px;padding:36px 24px;text-align:center;background:linear-gradient(135deg,rgba(247,147,26,0.07),rgba(247,147,26,0.02));border:1px dashed rgba(247,147,26,0.35);border-radius:20px;position:relative;overflow:hidden">
+          <div style="position:absolute;inset:0;pointer-events:none;background:radial-gradient(ellipse 60% 80% at 50% 50%,rgba(247,147,26,0.06),transparent 70%)"></div>
+          <div style="position:relative;z-index:1">
+            <div style="font-size:44px;margin-bottom:14px;filter:drop-shadow(0 0 18px rgba(247,147,26,0.5))">⚡</div>
+            <div style="font-family:Syne,sans-serif;font-weight:800;font-size:20px;color:#fff;margin-bottom:8px">Connect Your Bitcoin Wallet</div>
+            <div style="font-size:13px;color:var(--text-muted);margin-bottom:24px;max-width:380px;margin-left:auto;margin-right:auto;line-height:1.6">Connect to view your OPILL, PILL &amp; MOTO balances, trade NFTs, and access all DeFi features.</div>
+            <button onclick="openWalletModal()" style="background:linear-gradient(135deg,#f7931a,#e8730a);border:none;border-radius:12px;color:#fff;font-family:Syne,sans-serif;font-weight:800;font-size:14px;letter-spacing:0.05em;padding:14px 36px;cursor:pointer;box-shadow:0 0 28px rgba(247,147,26,0.45);transition:all 0.2s" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 0 40px rgba(247,147,26,0.65)'" onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='0 0 28px rgba(247,147,26,0.45)'">
+              ⚡ Connect Wallet
+            </button>
+            <div style="margin-top:14px;font-size:11px;color:var(--text-muted)">Supports OP_WALLET · UniSat · Xverse · OKX</div>
+          </div>
+        </div>
+
         <!-- ══ WALLET ASSETS DASHBOARD ══ -->
         <div id="wallet-assets-section" style="display:none;margin-bottom:24px">
 
@@ -3279,6 +3293,11 @@ function _onWalletConnected(result) {
   histRefresh();
   // ── Fetch real wallet asset balances ──
   if (window.WA) WA.onConnect(addr);
+  // ── Show wallet assets dashboard, hide connect prompt ──
+  var _wasSec = document.getElementById('wallet-assets-section');
+  var _homePrompt = document.getElementById('home-connect-prompt');
+  if (_wasSec) _wasSec.style.display = '';
+  if (_homePrompt) _homePrompt.style.display = 'none';
 }
 
 // ── Sign helper: returns {sig, txid} ──
@@ -4937,6 +4956,11 @@ function _onDisconnected(){
   if(info) info.style.display='none';
   if(addrEl) addrEl.textContent='--';
   if(balEl) balEl.textContent='-- BTC';
+  // ── Hide wallet assets, show connect prompt ──
+  var _wasSec = document.getElementById('wallet-assets-section');
+  var _homePrompt = document.getElementById('home-connect-prompt');
+  if(_wasSec) _wasSec.style.display='none';
+  if(_homePrompt) _homePrompt.style.display='';
   if(window.FaucetModule) FaucetModule.updateClaimButton(null);
   showToast('👋 Wallet disconnected','info');
 }
@@ -7193,7 +7217,7 @@ function _faucetAddRecentRow(addr, amount, token) {
 // ═══════════════════════════════════════════════════════════════
 (function() {
   'use strict';
-  var OPNET_API  = 'https://testnet.opnet.org';
+  var OPNET_API  = 'https://shotten-bently-skulkingly.ngrok-free.app';
   var MEMPOOL    = 'https://mempool.opnet.org/testnet4/api';
   var TIMEOUT_MS = 10000;
 
@@ -7206,25 +7230,19 @@ function _faucetAddRecentRow(addr, amount, token) {
 
   async function opnetBalanceOf(contractAddr, walletAddr) {
     try {
-      var resp = await fetchJson(OPNET_API, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({jsonrpc:'2.0',id:Date.now(),method:'eth_call',
-          params:[{to:contractAddr,data:'0x70a08231'+walletAddr.replace('0x','').toLowerCase().padStart(64,'0')},'latest']})
-      });
-      if (resp && resp.result && resp.result !== '0x' && resp.result !== '0x0') {
-        var val = parseInt(resp.result,16);
-        if (!isNaN(val) && val > 0) return val/1e8;
+      // Use backend REST endpoint: /api/token/:contract/balance/:addr
+      var resp = await fetchJson(
+        OPNET_API + '/api/token/' + encodeURIComponent(contractAddr) + '/balance/' + encodeURIComponent(walletAddr)
+      );
+      if (resp && resp.balance !== undefined && resp.balance !== null) {
+        var val = parseFloat(resp.balance);
+        if (!isNaN(val)) return val;
       }
     } catch(e) {}
     return null;
   }
 
   async function opnetBlockNumber() {
-    try {
-      var r = await fetchJson(OPNET_API, {method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({jsonrpc:'2.0',id:Date.now(),method:'eth_blockNumber',params:[]})});
-      if (r && r.result) return parseInt(r.result,16);
-    } catch(e) {}
     try {
       var h = await fetchJson(MEMPOOL+'/blocks/tip/height');
       if (typeof h === 'number') return h;
